@@ -1,0 +1,235 @@
+"""Tests for the live stitcher.
+
+Run with ``python -m pytest image_stitching/live/tests -q`` or directly
+``python image_stitching/live/tests/test_live.py``.
+
+The synthetic tests pin down the behaviours that the recorded scans exposed;
+
+* translation recovery from a known shift,
+* rejection of a black / flat / defocused frame,
+* rejection of a duplicate (stalled motor),
+* holes being filled by soft frames without overwriting good pixels,
+* the session surviving a frame the pipeline cannot process.
+
+The optional real-data tests use ``from_scratch/test_images`` when present and
+are skipped otherwise.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[2]      # image_stitching/
+sys.path.insert(0, str(ROOT))
+
+from live.config import LiveConfig                                      # noqa: E402
+from live.mosaic import IncrementalMosaic                               # noqa: E402
+from live.pipeline import LiveStitcher                                  # noqa: E402
+from live.quality import assess_intrinsic, sharpness                    # noqa: E402
+from live.registration import Registrar                                 # noqa: E402
+
+SCAN_DIR = ROOT / "from_scratch" / "test_images"
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+def texture(h=600, w=800, seed=7) -> np.ndarray:
+    """A deterministic, richly textured fake blade surface."""
+    rng = np.random.default_rng(seed)
+    base = rng.normal(128, 22, (h, w)).astype(np.float32)
+    base = cv2.GaussianBlur(base, (0, 0), 1.2)
+    for _ in range(40):                                  # speckle + pits
+        x, y = rng.integers(10, w - 10), rng.integers(10, h - 10)
+        cv2.circle(base, (int(x), int(y)), int(rng.integers(2, 9)), 40, -1)
+    for _ in range(6):                                   # long scratches
+        p1 = (int(rng.integers(0, w)), int(rng.integers(0, h)))
+        p2 = (int(rng.integers(0, w)), int(rng.integers(0, h)))
+        cv2.line(base, p1, p2, 200, int(rng.integers(1, 3)))
+    base = np.clip(base, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+
+
+def crop(img, dy, dx=0, h=400, w=600):
+    return img[dy:dy + h, dx:dx + w].copy()
+
+
+def no_log(*_a):
+    pass
+
+
+# ── registration ─────────────────────────────────────────────────────────────
+def test_recovers_known_shift():
+    img = texture()
+    a, b = crop(img, 0), crop(img, 130, 20)
+    cfg = LiveConfig()
+    reg = Registrar(cfg)
+    reg.prepare("a", a)
+    reg.prepare("b", b)
+    r = reg.register("a", "b")
+    assert r is not None, "registration failed on a clean synthetic pair"
+    dx, dy = r.shift
+    assert abs(dx - 20) < 3 and abs(dy - 130) < 3, f"shift off: {(dx, dy)}"
+    assert r.ncc > 0.9
+
+
+def test_prior_rescues_when_matches_are_contradictory():
+    """The prior must not be able to invent a transform that the pixels reject."""
+    img = texture()
+    cfg = LiveConfig()
+    reg = Registrar(cfg)
+    reg.prepare("a", crop(img, 0))
+    reg.prepare("b", crop(img, 200))
+    # a prior pointing the wrong way must NOT be trusted blindly
+    r = reg.register("a", "b", np.array([0.0, -260.0], np.float32))
+    assert r is None or r.ncc > cfg.min_ncc
+
+
+# ── quality gate ─────────────────────────────────────────────────────────────
+def test_black_and_flat_frames_rejected():
+    cfg = LiveConfig()
+    assert not assess_intrinsic(np.zeros((400, 600, 3), np.uint8), cfg).ok
+    flat = np.full((400, 600, 3), 128, np.uint8)
+    assert not assess_intrinsic(flat, cfg).ok
+
+
+def test_defocus_is_visible_to_the_sharpness_measure():
+    img = texture()
+    soft = cv2.GaussianBlur(img, (0, 0), 5.0)
+    assert sharpness(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)) > \
+        1.8 * sharpness(cv2.cvtColor(soft, cv2.COLOR_BGR2GRAY))
+
+
+# ── mosaic ───────────────────────────────────────────────────────────────────
+def test_mosaic_places_and_averages():
+    img = texture()
+    cfg = LiveConfig(flush_every=0)
+    mo = IncrementalMosaic(cfg)
+    mo.add(img, np.eye(3))
+    T = np.array([[1, 0, 0], [0, 1, 300], [0, 0, 1]], float)
+    res = mo.add(img, T)
+    assert 0.3 < res.new_area < 0.7
+    mosaic, coverage, lowq = mo.render()
+    assert mosaic.shape[0] == 600 + 300 and mosaic.shape[1] == 800
+    assert (coverage > 0).all() and not (lowq > 0).any()
+    x0, y0, x1, y1 = mo.bbox()
+    assert (x1 - x0, y1 - y0) == (800, 900)
+
+
+def test_soft_frame_only_fills_holes():
+    """A soft fill-in must never overwrite pixels that are already good."""
+    img = texture()
+    soft = cv2.GaussianBlur(img, (0, 0), 4.0)
+    mo = IncrementalMosaic(LiveConfig(flush_every=0))
+    mo.add(img, np.eye(3))
+    T = np.array([[1, 0, 0], [0, 1, 300], [0, 0, 1]], float)
+    res = mo.add(soft, T, empty_only=True, low_quality=True)
+    mosaic, _, lowq = mo.render()
+    # the soft frame contributed only the band it alone covers
+    assert 0.0 < res.new_area <= 0.51
+    covered_rows = (lowq > 0).any(axis=1)
+    assert covered_rows.sum() > 0 and covered_rows[:600].sum() == 0
+
+
+# ── pipeline ─────────────────────────────────────────────────────────────────
+def _pipeline(tmp_path, **kw):
+    return LiveStitcher(LiveConfig(flush_every=0, **kw),
+                        out_prefix=str(tmp_path / "run"), log=no_log)
+
+
+def test_pipeline_keeps_good_frames_and_drops_duplicates(tmp_path):
+    img = texture()
+    st = _pipeline(tmp_path)
+    try:
+        d1 = st.process(crop(img, 0), "a")
+        d2 = st.process(crop(img, 150), "b")
+        d3 = st.process(crop(img, 150), "c")          # stalled motor: duplicate
+        assert d1.ok and d2.ok
+        assert not d3.ok and "duplicate" in d3.reason
+        assert st.mosaic.count == 2
+    finally:
+        st.stop()
+
+
+def test_pipeline_drops_defocused_frame(tmp_path):
+    img = texture()
+    st = _pipeline(tmp_path)
+    try:
+        st.process(crop(img, 0), "a")
+        d = st.process(cv2.GaussianBlur(crop(img, 150), (0, 0), 6.0), "b")
+        assert not d.ok
+        assert "focus" in d.reason or "soft" in d.reason
+    finally:
+        st.stop()
+
+
+def test_pipeline_survives_a_broken_frame(tmp_path):
+    img = texture()
+    st = _pipeline(tmp_path)
+    try:
+        st.process(crop(img, 0), "a")
+        # an all-black frame exercises the reject path, not an exception
+        d = st.process(np.zeros((400, 600, 3), np.uint8), "bad")
+        assert not d.ok
+        d2 = st.process(crop(img, 150), "b")
+        assert d2.ok, "pipeline stopped accepting frames after a bad one"
+    finally:
+        st.stop()
+
+
+def test_submit_is_asynchronous_and_finalize_writes_outputs(tmp_path):
+    img = texture()
+    st = LiveStitcher(LiveConfig(flush_every=0), out_prefix=str(tmp_path / "run"),
+                      log=no_log)
+    for i, dy in enumerate((0, 150, 300)):
+        st.submit(crop(img, dy), f"f{i}")
+    assert st.wait_idle(30), "worker did not drain the queue"
+    paths = st.finalize()
+    assert Path(paths["png"]).exists() and Path(paths["coverage"]).exists()
+    assert Path(str(tmp_path / "run_frames.csv")).exists()
+    assert Path(str(tmp_path / "run_report.txt")).exists()
+
+
+# ── real data (skipped when the sample scan is absent) ───────────────────────
+def _real_pairs(n=6):
+    files = sorted(SCAN_DIR.glob("col01_Ydown_[0-9]*.jpg"))
+    return files[:n]
+
+
+def test_real_pair_registration_matches_measured_motion():
+    files = _real_pairs(4)
+    if len(files) < 2:
+        return "skipped: sample scan not available"
+    cfg = LiveConfig()
+    reg = Registrar(cfg)
+    for p in files:
+        reg.prepare(p.name, cv2.imread(str(p)))
+    for prev, cur in zip(files, files[1:]):
+        r = reg.register(prev.name, cur.name)
+        assert r is not None
+        dx, dy = r.shift
+        # measured on this scan: one motor step moves 210-490 px, mostly in Y
+        assert 150 < abs(dy) < 550, f"{cur.name}: implausible dy={dy}"
+        assert abs(dx) < 120, f"{cur.name}: implausible dx={dx}"
+        assert r.ncc > 0.8
+
+
+if __name__ == "__main__":
+    import tempfile
+
+    failures = 0
+    for name, fn in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(fn):
+            continue
+        try:
+            if "tmp_path" in fn.__code__.co_varnames[:fn.__code__.co_argcount]:
+                with tempfile.TemporaryDirectory() as td:
+                    fn(Path(td))
+            else:
+                fn()
+            print(f"PASS {name}")
+        except Exception as exc:                       # noqa: BLE001
+            failures += 1
+            print(f"FAIL {name}: {exc}")
+    sys.exit(1 if failures else 0)

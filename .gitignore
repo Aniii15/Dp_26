@@ -1,2 +1,11 @@
 .DS_Store
 __pycache__/
+# generated mosaics / scan output
+image_stitching/live/**/runs/
+main_code/blade_mosaic/
+main_code/blade_images/
+image_stitching/**/_kept/
+image_stitching/**/_rejected/
+image_stitching/**/purge_report.csv
+*.pyc
+

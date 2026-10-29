@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Planar close-range blade mosaic from a motorized raster scan.
 
+NOTE (offline/batch version): this script stitches a folder *after* a scan.  For
+on-the-fly stitching with frame rejection, see ../live/README.md.  Measured on
+the recorded scans, this implementation's phase-correlation seeding is defeated
+by the periodic cooling-hole pattern and its ECC score is not a geometry check,
+so treat the diagnostics file as informational only.
+
 Uses phase-correlation for translation initialization, ECC affine refinement,
 ORB+RANSAC fallback, exposure compensation and distance-transform feathering.
 It deliberately avoids panorama/spherical projection: these are near-planar

@@ -17,6 +17,7 @@ import threading
 import time
 import queue
 import os
+import sys
 
 import requests
 import numpy as np
@@ -60,6 +61,17 @@ FRAME_DIFF_THRESHOLD = 20      # per-pixel diff that counts as "changed"
 # Boundary detection tuning
 BOUNDARY_THRESHOLD = 30  # gray level separating blade from background
 UPPER_BOUNDARY_THRESHOLD = 50  # stricter threshold for upper-boundary checks
+
+# Live (on-the-fly) mosaicking.  When enabled, every frame the sweep saves is
+# also pushed to the streaming stitcher in image_stitching/live, which blends it
+# into a growing mosaic and rejects blurry/duplicate/unregisterable frames as
+# they arrive.  Set to False to keep the original save-only behaviour.
+LIVE_STITCH = True
+LIVE_STITCH_CONFIG = {
+    "flush_every": 10,      # write a partial mosaic every N accepted frames
+    "output_scale": 1.0,    # 0.5 halves mosaic memory 4x for very large parts
+    "anchors": 2,           # frames registered against, for drift control
+}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -389,6 +401,10 @@ class MotorControlApp(tk.Tk):
         self._latest_pred_str = "Waiting..."
         self._frame_a_bgr = None
         self._feed_fps = 0.0
+
+        # Streaming mosaic (optional; enabled by LIVE_STITCH)
+        self._stitcher = None
+        self._stitcher_dir = None
 
         self._build_ui()
         self._poll_log_queue()
@@ -1032,6 +1048,54 @@ class MotorControlApp(tk.Tk):
                 self._log(f"[SWEEP] Failed to save image: {filename}")
         except Exception as e:
             self._log(f"[SWEEP] Error saving image: {e}")
+        self._stitch_submit(frame, filename)
+
+    # ── Live mosaic ───────────────────────────────────────────────────────────
+
+    def _stitch_submit(self, frame, filename: str):
+        """Hand a freshly captured frame to the streaming stitcher.
+
+        Non-blocking: the stitcher runs its own worker thread, so motor timing
+        and autofocus are never delayed by registration.  Frames it rejects
+        (blurry, duplicate, unregisterable) are logged but otherwise ignored.
+        """
+        if not LIVE_STITCH or frame is None:
+            return
+        try:
+            if self._stitcher is None:
+                # Imported lazily: the GUI must still start on a machine
+                # without the stitching pipeline present.
+                sys.path.insert(0, os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..", "image_stitching"))
+                from live import LiveConfig, LiveStitcher
+                out_dir = os.path.join(os.path.dirname(__file__), "blade_mosaic")
+                os.makedirs(out_dir, exist_ok=True)
+                self._stitcher_dir = out_dir
+                self._stitcher = LiveStitcher(
+                    LiveConfig(**LIVE_STITCH_CONFIG),
+                    out_prefix=os.path.join(
+                        out_dir, f"live_{time.strftime('%Y%m%d_%H%M%S')}"),
+                    log=lambda m: self._log(m))
+            meta = {"file": filename}
+            self._stitcher.submit(frame, filename.rsplit(".", 1)[0], meta)
+        except Exception as e:      # stitching must never break a scan
+            self._log(f"[STITCH] disabled after error: {e}")
+            self._stitcher = None
+
+    def _stitch_finalize(self):
+        if self._stitcher is None:
+            return
+        stitcher, self._stitcher = self._stitcher, None
+        try:
+            paths = stitcher.finalize()
+            s = stitcher.summary()
+            self._log(
+                f"[STITCH] mosaic {paths.get('shape')} from {s['accepted']} "
+                f"frames, {s['filled']} soft fill-ins, {s['rejected']} dropped "
+                f"-> {paths.get('png')}")
+        except Exception as e:
+            self._log(f"[STITCH] finalize failed: {e}")
 
     def _boundary_pct(self, detect_threshold=None) -> dict | None:
         """Blade boundary distances from frame edges in percent, or None if no frame."""
@@ -1197,6 +1261,8 @@ class MotorControlApp(tk.Tk):
         elapsed = int(time.time() - start_time)
         self._log(
             f"[SWEEP] Scan complete or stopped. Total time: {elapsed // 60}m {elapsed % 60}s")
+        self._log("[STITCH] writing final mosaic...")
+        self._stitch_finalize()
         for n, t in enumerate(column_times, 1):
             self._log(f"[SWEEP]   Column {n}: {t // 60}m {t % 60}s")
         if column_times:

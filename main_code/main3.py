@@ -377,8 +377,13 @@ class MotorControlApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ESP32 Motor Control System")
-        self.geometry("1280x860")
-        self.minsize(1100, 800)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        # ~25 menu bar + ~80 dock
+        w, h = min(1280, sw - 40), min(900, sh - 110)
+        self.geometry(f"{w}x{h}+{max(0, (sw-w)//2)}+40")
+        self.minsize(900, 560)
+        # self.geometry("1280x860")
+        # self.minsize(1100, 800)
         self.configure(bg=C["bg"])
 
         self._log_queue = queue.Queue()
@@ -414,6 +419,45 @@ class MotorControlApp(tk.Tk):
         self._autosweep_timer_tick()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # -- Scrollable Element ---------------------------------------------------
+    def _build_scrollable(self, parent, builder):
+        """Wrap a panel in a vertical scroll viewport so it can never be clipped."""
+        canvas = tk.Canvas(parent, bg=C["bg"], highlightthickness=0, bd=0)
+        bar = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=C["bg"])
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(
+            win, width=e.width))
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        def _wheel(event):
+            if getattr(event, "num", None) == 4:
+                step = -1
+            elif getattr(event, "num", None) == 5:
+                step = 1
+            else:
+                step = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(step * 2, "units")
+
+        def _bind(_):
+            canvas.bind_all("<MouseWheel>", _wheel)
+            canvas.bind_all("<Button-4>", _wheel)
+            canvas.bind_all("<Button-5>", _wheel)
+
+        def _unbind(_):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                canvas.unbind_all(seq)
+
+        canvas.bind("<Enter>", _bind)
+        canvas.bind("<Leave>", _unbind)
+        builder(inner)
+        return canvas
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
@@ -514,7 +558,9 @@ class MotorControlApp(tk.Tk):
             0, int(self.winfo_width() * 0.55), 0))
 
         self._build_feed_panel(feed_cell)
-        self._build_controls_panel(controls_cell)
+        # self._build_controls_panel(controls_cell)
+        self._build_scrollable(controls_cell, self._build_controls_panel)
+        self.update_idletasks()
 
     # ── Generic Axis Panel (Z / X / R) ────────────────────────────────────────
 
@@ -896,7 +942,7 @@ class MotorControlApp(tk.Tk):
         tk.Label(inner, text="▸ LOG", bg=C["panel"], fg=C["accent"],
                  font=FONT_TITLE).pack(anchor="w")
         self._log_text = scrolledtext.ScrolledText(
-            inner, height=8, bg=C["surface"], fg=C["text"],
+            inner, height=5, bg=C["surface"], fg=C["text"],
             insertbackground=C["text"], relief="flat", font=FONT_SMALL,
             state="disabled", wrap="word")
         self._log_text.pack(fill="both", expand=True, pady=4)

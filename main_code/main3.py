@@ -1069,7 +1069,8 @@ class MotorControlApp(tk.Tk):
                     os.path.dirname(os.path.abspath(__file__)),
                     "..", "image_stitching"))
                 from live import LiveConfig, LiveStitcher
-                out_dir = os.path.join(os.path.dirname(__file__), "blade_mosaic")
+                out_dir = os.path.join(
+                    os.path.dirname(__file__), "blade_mosaic")
                 os.makedirs(out_dir, exist_ok=True)
                 self._stitcher_dir = out_dir
                 self._stitcher = LiveStitcher(

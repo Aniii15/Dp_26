@@ -167,8 +167,22 @@ class LiveStitcher:
             return False
 
     def process(self, frame: np.ndarray, tag: str, meta: dict | None = None,
-                index: int | None = None) -> Decision:
-        """Synchronous path - used by the worker and by the offline tests."""
+                index: int | None = None, record: bool = True) -> Decision:
+        """Process one frame synchronously and account for it.
+
+        Recording happens here rather than in the worker so that a caller using
+        this method directly (an embedded GUI, a test) gets the same
+        bookkeeping as the queue: ``summary()`` and the CSV stay consistent with
+        what was actually stitched.
+        """
+        d = self._process(frame, tag, meta, index)
+        if record:
+            self._record(d)
+        return d
+
+    def _process(self, frame: np.ndarray, tag: str, meta: dict | None = None,
+                 index: int | None = None) -> Decision:
+        """The actual decision logic for one frame."""
         t0 = time.perf_counter()
         cfg = self.cfg
         d = Decision(tag=tag, index=self._counter if index is None else index)
@@ -326,6 +340,45 @@ class LiveStitcher:
         self._maybe_flush()
         return d
 
+    # ── live preview (for a GUI) ────────────────────────────────────────────
+    def preview(self, max_width: int = 480, timeout: float = 2.0
+                ) -> tuple[np.ndarray | None, dict]:
+        """Thread-safe snapshot of the mosaic so far, as RGB, for a live view.
+
+        Returns ``(rgb_or_None, summary)``.  Blending happens on the worker
+        thread while holding ``self._lock``, so the snapshot takes the same lock
+        and can never observe a half-blended canvas (torn image) or a canvas
+        being grown underneath it.
+
+        ``max_width`` keeps the per-second cost sane: rendering the full canvas
+        is ~180 ms at part scale, and the GUI polls about once a second.
+        """
+        if not self._lock.acquire(timeout=timeout):
+            return None, {}          # worker is busy; the GUI shows the old frame
+        try:
+            summary = self.summary()
+            if self.mosaic.count == 0:
+                return None, summary
+            mosaic, coverage, lowq = self.mosaic.render()
+            covered = int(np.count_nonzero(coverage))
+            soft = int(np.count_nonzero(lowq))
+            summary["low_quality_pct"] = (100.0 * soft / covered) if covered else 0.0
+        finally:
+            self._lock.release()
+
+        h, w = mosaic.shape[:2]
+        if max_width and w > max_width:
+            k = max_width / float(w)
+            mosaic = cv2.resize(mosaic, (int(max_width), max(1, int(round(h * k)))),
+                                interpolation=cv2.INTER_AREA)
+        summary["preview_w"], summary["preview_h"] = mosaic.shape[1], mosaic.shape[0]
+        return cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB), summary
+
+    def flush(self, prefix: str | None = None) -> dict:
+        """Write the mosaic as it stands now (manual snapshot from the GUI)."""
+        with self._lock:
+            return self.mosaic.save(prefix or (self.prefix + "_partial"))
+
     def finalize(self) -> dict:
         """Stop the worker, flush the mosaic and write the audit trail."""
         if self._finalized:
@@ -412,7 +465,6 @@ class LiveStitcher:
                 with self._lock:
                     try:
                         d = self.process(frame, tag, meta, index=idx)
-                        self._record(d)
                     except Exception as exc:
                         # One bad frame (or one exhausted canvas limit) must
                         # never kill the pipeline mid-scan.

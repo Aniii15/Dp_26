@@ -12,12 +12,13 @@ boundary-guided sweep that saves images per column.
 """
 
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, ttk
 import threading
 import time
 import queue
 import os
 import sys
+import subprocess
 
 import requests
 import numpy as np
@@ -222,7 +223,10 @@ if HAS_TORCH:
             return self.classifier(torch.cat((feat_a, feat_b), dim=1))
 
 
-MODEL_PATH = "siamese_focus_model.pth"
+# Absolute so the model loads whether the GUI is launched from main_code/,
+# the repo root, or an IDE (a bare filename is resolved against the cwd).
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "siamese_focus_model.pth")
 AI_MODEL = AI_TRANSFORM = AI_DEVICE = AI_OPTIMIZER = AI_CRITERION = None
 _ai_load_attempted = False
 
@@ -376,7 +380,7 @@ FONT_SMALL = ("Consolas", 9)
 class MotorControlApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("ESP32 Motor Control System")
+        self.title("ESP32 Motor Control System — Blade Inspector")
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         # ~25 menu bar + ~80 dock
         w, h = min(1280, sw - 40), min(900, sh - 110)
@@ -410,13 +414,19 @@ class MotorControlApp(tk.Tk):
         # Streaming mosaic (optional; enabled by LIVE_STITCH)
         self._stitcher = None
         self._stitcher_dir = None
+        self._mosaic_pending = False     # a preview fetch is in flight
+        self._ui_queue = queue.Queue()   # work for the Tk thread (thread-safe)
+        self._mosaic_photo = None        # keeps the Tk image alive
+        self._vis_h = 300                # height of the feed|mosaic row
 
         self._build_ui()
         self._poll_log_queue()
+        self._poll_ui_queue()
         self._update_connection_indicator()
         self._feed_ui_tick()
         self._status_ui_tick()
         self._autosweep_timer_tick()
+        self._mosaic_ui_tick()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -424,7 +434,7 @@ class MotorControlApp(tk.Tk):
     def _build_scrollable(self, parent, builder):
         """Wrap a panel in a vertical scroll viewport so it can never be clipped."""
         canvas = tk.Canvas(parent, bg=C["bg"], highlightthickness=0, bd=0)
-        bar = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        bar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=bar.set)
         bar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
@@ -461,15 +471,69 @@ class MotorControlApp(tk.Tk):
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
+    def _setup_style(self):
+        """Dark ttk theme for the widgets ttk is used for (tabs, scrollbars).
+
+        Everything else is a tk widget with explicit colours from C; this only
+        has to make ttk's chrome match, so no global theme surgery.
+        """
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("TScrollbar", background=C["btn_bg"], troughcolor=C["bg"],
+                        bordercolor=C["bg"], arrowcolor=C["muted"], relief="flat")
+        style.map("TScrollbar", background=[("active", C["btn_hover"])])
+        style.configure("TNotebook", background=C["bg"], borderwidth=0,
+                        tabmargins=(6, 6, 6, 0))
+        style.configure("TNotebook.Tab", background=C["surface"],
+                        foreground=C["muted"], padding=(16, 7), borderwidth=0,
+                        font=FONT_LABEL)
+        style.map("TNotebook.Tab",
+                  background=[("selected", C["panel"]), ("active", C["btn_bg"])],
+                  foreground=[("selected", C["accent"]), ("active", C["text"])])
+
+    def _section(self, parent, text, color=None, pady=(10, 4)):
+        """Section heading with a rule to its right — replaces bare '▸ TITLE'."""
+        row = tk.Frame(parent, bg=C["panel"])
+        row.pack(fill="x", pady=pady)
+        tk.Label(row, text=text, bg=C["panel"], fg=color or C["accent"],
+                 font=FONT_TITLE).pack(side="left")
+        tk.Frame(row, bg=C["border"], height=1).pack(
+            side="left", fill="x", expand=True, padx=(10, 0), pady=(7, 0))
+        return row
+
+    def _card(self, parent, title, color=None, subtitle="", pady=(8, 8)):
+        """Full-width bordered card inside a tab."""
+        outer = tk.Frame(parent, bg=C["border"], padx=1, pady=1)
+        outer.pack(fill="x", pady=pady, padx=4)
+        inner = tk.Frame(outer, bg=C["panel"], padx=12, pady=10)
+        inner.pack(fill="both", expand=True)
+        self._section(inner, title, color, pady=(0, 6))
+        if subtitle:
+            tk.Label(inner, text=subtitle, bg=C["panel"], fg=C["muted"],
+                     font=FONT_SMALL).pack(anchor="w", pady=(0, 6))
+        return inner
+
     def _build_ui(self):
-        # Top bar
+        self._setup_style()
+        self._build_header()
+        self._build_statusbar()     # packed to the bottom, so it can never clip
+        self._build_visuals()       # live feed | live mosaic
+        self._build_tabs()
+        self.update_idletasks()
+        self.bind("<Configure>", self._on_window_resize)
+
+    def _build_header(self):
         top = tk.Frame(self, bg=C["surface"], pady=8, padx=16)
         top.pack(fill="x", side="top")
 
         tk.Label(top, text="⚙  ESP32 MOTOR CONTROL", bg=C["surface"],
                  fg=C["accent"], font=("Consolas", 15, "bold")).pack(side="left")
+        tk.Label(top, text="blade inspection console", bg=C["surface"],
+                 fg=C["muted"], font=FONT_SMALL).pack(side="left", padx=(10, 0))
 
-        # Connection indicator
         conn = tk.Frame(top, bg=C["surface"])
         conn.pack(side="right", padx=10)
         self.conn_dot = tk.Label(conn, text="●", bg=C["surface"],
@@ -482,85 +546,283 @@ class MotorControlApp(tk.Tk):
                   bg=C["btn_bg"], fg=C["text"], font=FONT_SMALL,
                   relief="flat", padx=8, cursor="hand2").pack(side="left", padx=6)
 
-        # IP entry
         tk.Label(top, text="ESP32 IP:", bg=C["surface"], fg=C["muted"],
                  font=FONT_SMALL).pack(side="right", padx=(0, 2))
         self.ip_var = tk.StringVar(value=ESP32_IP)
         ip_entry = tk.Entry(top, textvariable=self.ip_var, width=14,
-                            bg=C["panel"], fg=C["text"], insertbackground=C["text"],
-                            relief="flat", font=FONT_SMALL)
+                            bg=C["panel"], fg=C["text"],
+                            insertbackground=C["text"], relief="flat",
+                            font=FONT_SMALL)
         ip_entry.pack(side="right")
         ip_entry.bind("<Return>", self._apply_ip)
 
-        # E-STOP
         tk.Button(self, text="⛔  EMERGENCY STOP", command=self._emergency_stop,
                   bg=C["danger"], fg="white", font=("Consolas", 13, "bold"),
                   relief="flat", padx=20, pady=6, cursor="hand2"
                   ).pack(fill="x", padx=16, pady=(8, 4))
 
-        # Main area
-        main = tk.Frame(self, bg=C["bg"])
-        main.pack(fill="both", expand=True, padx=16, pady=4)
-
-        # Motor rows
-        top_motors = tk.Frame(main, bg=C["bg"])
-        top_motors.pack(fill="x")
-        row1 = tk.Frame(top_motors, bg=C["bg"])
-        row1.pack(fill="x", pady=(0, 2))
-        row2 = tk.Frame(top_motors, bg=C["bg"])
-        row2.pack(fill="x", pady=(0, 2))
-        row3 = tk.Frame(top_motors, bg=C["bg"])
-        row3.pack(fill="x", pady=(0, 4))
-
-        self._build_axis_panel(
-            row1, "M1 — Z AXIS", tag="Z",
-            modes=("mm", "steps"), default_mode="mm", default_val="1.0",
-            to_steps=lambda v, m: mm_to_z_steps(v) if m == "mm" else int(v),
-            describe=lambda v, m: (f"= {mm_to_z_steps(v):,} pulses" if m == "mm"
-                                   else f"= {int(v):,} pulses (direct)"),
-            mover=move_z, buttons=[("▲ +", 1, "+"), ("▼ −", 0, "-")])
-
-        self._build_axis_panel(
-            row1, "M3 — X AXIS", tag="X",
-            modes=("mm", "steps"), default_mode="mm", default_val="1.0",
-            to_steps=lambda v, m: mm_to_x_steps(v) if m == "mm" else int(v),
-            describe=lambda v, m: (f"= {mm_to_x_steps(v):,} pulses" if m == "mm"
-                                   else f"= {int(v):,} pulses (direct)"),
-            mover=move_x, buttons=[("◀ −", 0, "-"), ("+ ▶", 1, "+")])
-
-        self._build_axis_panel(
-            row1, "M2 — ROTATION", tag="R",
-            modes=("steps", "degrees"), default_mode="steps", default_val="1600",
-            to_steps=lambda v, m: int(
-                v) if m == "steps" else degrees_to_r_steps(v),
-            describe=lambda v, m: (f"= {int(v):,} pulses = {v * DEGREES_PER_STEP:.2f}°" if m == "steps"
-                                   else f"= {degrees_to_r_steps(v):,} pulses ({v:.2f}°)"),
-            mover=move_r, buttons=[("↻ CW", 1, "CW"), ("↺ CCW", 0, "CCW")])
-
-        self._build_actuator_panel(row2)
-        self._build_speed_panel(row2)
-
-        self._build_motion_detector_panel(row3)
-        self._build_boundary_detector_panel(row3)
-
-        self._build_cmd_bar(main)
-
-        # Bottom half: draggable PanedWindow (feed | controls)
-        paned = tk.PanedWindow(main, orient="horizontal", bg=C["border"],
-                               sashwidth=6, sashrelief="flat", bd=0, handlesize=0)
-        paned.pack(fill="both", expand=True, pady=(4, 0))
+    def _build_visuals(self):
+        """Live feed beside the growing mosaic — both visible while sweeping."""
+        wrap = tk.Frame(self, bg=C["bg"])
+        wrap.pack(fill="x", padx=16, pady=(2, 2))
+        paned = tk.PanedWindow(wrap, orient="horizontal", bg=C["border"],
+                               sashwidth=6, sashrelief="flat", bd=0,
+                               handlesize=0, height=self._vis_h)
+        paned.pack(fill="both", expand=True)
+        self._visuals = paned
 
         feed_cell = tk.Frame(paned, bg=C["bg"])
-        controls_cell = tk.Frame(paned, bg=C["bg"])
-        paned.add(feed_cell, stretch="always", minsize=200)
-        paned.add(controls_cell, stretch="always", minsize=350)
-        self.after(100, lambda: paned.sash_place(
-            0, int(self.winfo_width() * 0.55), 0))
+        mosaic_cell = tk.Frame(paned, bg=C["bg"])
+        paned.add(feed_cell, stretch="always", minsize=260)
+        paned.add(mosaic_cell, stretch="always", minsize=200)
+        self.after(150, lambda: paned.sash_place(
+            0, int(max(300, self.winfo_width() * 0.52)), 0))
 
         self._build_feed_panel(feed_cell)
-        # self._build_controls_panel(controls_cell)
-        self._build_scrollable(controls_cell, self._build_controls_panel)
-        self.update_idletasks()
+        self._build_mosaic_panel(mosaic_cell)
+
+    def _on_window_resize(self, event):
+        """Keep the visual row at ~40 % of the window so tabs always fit."""
+        if event.widget is not self:
+            return
+        # The tabs carry the controls, so the visual row only needs ~1/3 of
+        # the window; the notebook takes the rest and scrolls if it must.
+        target = int(max(220, min(0.34 * event.height, event.height - 320)))
+        if abs(target - self._vis_h) >= 8:
+            self._vis_h = target
+            try:
+                self._visuals.configure(height=target)
+            except tk.TclError:
+                pass
+
+    # ── Live mosaic panel ─────────────────────────────────────────────────────
+
+    def _build_mosaic_panel(self, parent):
+        outer = tk.Frame(parent, bg=C["border"], padx=1, pady=1)
+        outer.pack(fill="both", expand=True, pady=4, padx=(4, 0))
+        inner = tk.Frame(outer, bg=C["panel"], padx=10, pady=8)
+        inner.pack(fill="both", expand=True)
+
+        hdr = tk.Frame(inner, bg=C["panel"])
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="▸ LIVE MOSAIC", bg=C["panel"], fg=C["accent2"],
+                 font=FONT_TITLE).pack(side="left")
+        self._make_btn(hdr, "Folder", self._open_mosaic_folder).pack(
+            side="right", padx=2)
+        self._make_btn(hdr, "Save now", self._stitch_snapshot).pack(
+            side="right", padx=2)
+
+        tk.Frame(inner, bg=C["border"], height=1).pack(fill="x", pady=4)
+
+        self._mosaic_label = tk.Label(
+            inner, bg=C["bg"], fg=C["muted"], font=FONT_SMALL,
+            text="No mosaic yet\nstart a sweep", anchor="center")
+        self._mosaic_label.pack(fill="both", expand=True)
+
+        self._mosaic_stat_var = tk.StringVar(value="no frames stitched")
+        tk.Label(inner, textvariable=self._mosaic_stat_var, bg=C["panel"],
+                 fg=C["muted"], font=FONT_SMALL, anchor="w",
+                 justify="left").pack(fill="x", pady=(6, 0))
+
+    def _post(self, fn):
+        """Queue a callable to run on the Tk thread.
+
+        `after()` is not safe to call from a worker thread, so every background
+        thread hands its result over through this queue instead; the Tk thread
+        drains it in `_poll_ui_queue`.
+        """
+        self._ui_queue.put(fn)
+
+    def _poll_ui_queue(self):
+        for _ in range(20):                 # bounded, so one flood can't stall Tk
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as exc:        # a bad callback must not kill the loop
+                try:
+                    self._log(f"[UI] callback failed: {exc}")
+                except Exception:
+                    pass
+        self.after(50, self._poll_ui_queue)
+
+    def _mosaic_ui_tick(self):
+        """1 s loop — pull a snapshot of the live mosaic without blocking Tk.
+
+        Rendering the canvas takes ~180 ms and blending runs on the stitcher's
+        worker thread, so the pull happens off-thread and the result is handed
+        back through ``_post`` for the Tk thread to paint.
+        """
+        stitcher = self._stitcher
+        if stitcher is not None and not self._mosaic_pending:
+            self._mosaic_pending = True
+
+            def fetch(st=stitcher):
+                try:
+                    rgb, summary = st.preview(520)
+                except Exception as exc:          # never kill the UI loop
+                    rgb, summary = None, {"error": str(exc)}
+                self._post(lambda: self._mosaic_render(rgb, summary))
+
+            threading.Thread(target=fetch, daemon=True,
+                             name="mosaic-preview").start()
+        self.after(1000, self._mosaic_ui_tick)
+
+    def _mosaic_render(self, rgb, summary):
+        self._mosaic_pending = False
+        if not summary:
+            return
+        if "error" in summary:
+            self._mosaic_stat_var.set(f"preview error: {summary['error']}")
+            return
+
+        if rgb is not None and HAS_PIL:
+            ph, pw = rgb.shape[:2]
+            box_w = self._mosaic_label.winfo_width()
+            box_h = self._mosaic_label.winfo_height()
+            box_w = box_w if box_w > 40 else 420
+            box_h = box_h if box_h > 40 else 300
+            k = min(box_w / pw, box_h / ph)
+            size = (max(1, int(pw * k)), max(1, int(ph * k)))
+            img = Image.fromarray(rgb).resize(size, Image.LANCZOS)
+            self._mosaic_photo = ImageTk.PhotoImage(image=img)
+            self._mosaic_label.configure(image=self._mosaic_photo, text="")
+        elif rgb is not None:
+            self._mosaic_label.configure(
+                text="pip install Pillow to preview the mosaic")
+
+        canvas = summary.get("canvas") or (0, 0, 0, 0)
+        npct = summary.get("low_quality_pct")
+        lines = [
+            f"{summary.get('accepted', 0)} kept · {summary.get('filled', 0)} fill"
+            f" · {summary.get('rejected', 0)} dropped"
+            f" · {summary.get('disconnected', 0)} band(s)",
+            f"mean NCC {summary.get('mean_ncc', 0.0):.2f}"
+            f" · {canvas[2] - canvas[0]}×{canvas[3] - canvas[1]} px"
+            f" · {time.strftime('%H:%M:%S')}",
+        ]
+        if npct:
+            lines.append(f"soft fill-in covers {npct:.1f}% of the mosaic")
+        self._mosaic_stat_var.set("\n".join(lines))
+        if hasattr(self, "_sweep_stitch_var"):
+            self._sweep_stitch_var.set(
+                f"{summary.get('accepted', 0)} accepted · "
+                f"{summary.get('filled', 0)} soft fill-ins · "
+                f"{summary.get('rejected', 0)} rejected · "
+                f"NCC {summary.get('mean_ncc', 0.0):.2f}")
+        if hasattr(self, "_sb_stitch_var"):
+            self._sb_stitch_var.set(
+                f"stitched {summary.get('accepted', 0)}"
+                f"  ·  dropped {summary.get('rejected', 0)}")
+
+    def _stitch_snapshot(self):
+        stitcher = self._stitcher
+        if stitcher is None:
+            self._log("[STITCH] nothing to save yet — start a sweep first")
+            return
+
+        def work():
+            try:
+                paths = stitcher.flush()
+                self._log(f"[STITCH] snapshot saved: {paths.get('png')}")
+            except Exception as exc:
+                self._log(f"[STITCH] snapshot failed: {exc}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_mosaic_folder(self):
+        path = self._stitcher_dir or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "blade_mosaic")
+        try:
+            os.makedirs(path, exist_ok=True)
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            elif os.name == "nt":
+                os.startfile(path)                     # noqa: S606 (Windows)
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            self._log(f"[STITCH] cannot open {path}: {exc}")
+
+    def _on_stitch_decision(self, decision):
+        """Called on the stitcher thread — hand the verdict to the Tk thread.
+
+        Note the callback fires while the stitcher holds its own lock, so this
+        must stay cheap: queue the decision and return immediately.
+        """
+        self._post(lambda: self._stitch_decision_ui(decision))
+
+    def _stitch_decision_ui(self, decision):
+        if not hasattr(self, "_last_stitch_var"):
+            return
+        flagged = getattr(decision, "flagged", False)
+        label = "FILL" if flagged else ("KEEP" if decision.ok else "DROP")
+        colour = C["warn"] if flagged else (C["success"] if decision.ok else C["danger"])
+        self._last_stitch_var.set(
+            f"{label}  {decision.tag}  ·  {decision.reason or 'ok'}")
+        self._last_stitch_label.configure(fg=colour)
+
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+
+    def _build_tabs(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=16, pady=(2, 8))
+        self._notebook = nb
+
+        pages = [
+            ("  Sweep  ", self._build_tab_sweep, True),
+            ("  Focus  ", self._build_tab_focus, True),
+            ("  Manual  ", self._build_tab_manual, True),
+            ("  Calibration  ", self._build_tab_calibration, True),
+            ("  Log  ", self._build_tab_log, False),
+        ]
+        for title, builder, scroll in pages:
+            page = tk.Frame(nb, bg=C["bg"])
+            nb.add(page, text=title)
+            if scroll:
+                self._build_scrollable(page, builder)
+            else:
+                builder(page)
+
+    def _build_statusbar(self):
+        bar = tk.Frame(self, bg=C["surface"], padx=16, pady=5)
+        bar.pack(side="bottom", fill="x")
+
+        self._sb_conn_var = tk.StringVar(value="● OFFLINE")
+        self._sb_conn_label = tk.Label(bar, textvariable=self._sb_conn_var,
+                                       bg=C["surface"], fg=C["danger"],
+                                       font=FONT_SMALL)
+        self._sb_conn_label.pack(side="left")
+
+        self._sb_motion_var = tk.StringVar(value="● STILL")
+        self._sb_motion_label = tk.Label(bar, textvariable=self._sb_motion_var,
+                                         bg=C["surface"], fg=C["success"],
+                                         font=FONT_SMALL)
+        self._sb_motion_label.pack(side="left", padx=(16, 0))
+
+        self._sb_feed_var = tk.StringVar(value="feed off")
+        tk.Label(bar, textvariable=self._sb_feed_var, bg=C["surface"],
+                 fg=C["muted"], font=FONT_SMALL).pack(side="left", padx=(16, 0))
+
+        self._sb_col_var = tk.StringVar(value="column —")
+        tk.Label(bar, textvariable=self._sb_col_var, bg=C["surface"],
+                 fg=C["muted"], font=FONT_SMALL).pack(side="left", padx=(16, 0))
+
+        self._sb_stitch_var = tk.StringVar(value="stitched 0  ·  dropped 0")
+        tk.Label(bar, textvariable=self._sb_stitch_var, bg=C["surface"],
+                 fg=C["accent2"], font=FONT_SMALL).pack(side="right")
+
+        self._sb_clock_var = tk.StringVar(value="")
+        tk.Label(bar, textvariable=self._sb_clock_var, bg=C["surface"],
+                 fg=C["muted"], font=FONT_SMALL).pack(side="right", padx=(0, 16))
+
+        self._sb_tick()
+
+    def _sb_tick(self):
+        self._sb_clock_var.set(time.strftime("%H:%M:%S"))
+        self.after(1000, self._sb_tick)
 
     # ── Generic Axis Panel (Z / X / R) ────────────────────────────────────────
 
@@ -756,12 +1018,17 @@ class MotorControlApp(tk.Tk):
 
     def _status_ui_tick(self):
         """Refresh motion and boundary status indicators (100 ms loop)."""
-        if self._motion_detector.is_moving():
+        moving = self._motion_detector.is_moving()
+        if moving:
             self._md_status_var.set("● MOVING")
             self._feed_label.configure(fg=C["danger"])
         else:
             self._md_status_var.set("● STILL")
             self._feed_label.configure(fg=C["success"])
+        if hasattr(self, "_sb_motion_var"):
+            self._sb_motion_var.set("● MOVING" if moving else "● STILL")
+            self._sb_motion_label.configure(
+                fg=C["danger"] if moving else C["success"])
 
         with self._frame_lock:
             b = self._latest_boundaries
@@ -782,6 +1049,9 @@ class MotorControlApp(tk.Tk):
             self._autosweep_timer_var.set(
                 f"⏱ Total: {total // 60}m {total % 60}s"
                 f"   Column {self._autosweep_column_num}: {col // 60}m {col % 60}s")
+            if hasattr(self, "_sb_col_var"):
+                self._sb_col_var.set(
+                    f"col {self._autosweep_column_num} · {total // 60}m {total % 60}s")
         self.after(1000, self._autosweep_timer_tick)
 
     # ── Embedded DSLR Feed Panel ──────────────────────────────────────────────
@@ -837,48 +1107,70 @@ class MotorControlApp(tk.Tk):
         tk.Label(inner, textvariable=self._feed_status_var,
                  bg=C["panel"], fg=C["muted"], font=FONT_SMALL).pack(anchor="w", pady=4)
 
-    # ── Controls Panel (autosweep / RLHF / calibration / log) ─────────────────
+    # ── Tab: Sweep ────────────────────────────────────────────────────────────
 
-    def _build_controls_panel(self, parent):
-        outer = tk.Frame(parent, bg=C["border"], padx=1, pady=1)
-        outer.pack(fill="both", expand=True, pady=4, padx=(4, 0))
-        inner = tk.Frame(outer, bg=C["panel"], padx=8, pady=8)
-        inner.pack(fill="both", expand=True)
+    def _build_tab_sweep(self, parent):
+        box = self._card(parent, "AUTO SWEEP", C["warn"],
+                         "X: ±0.4 mm (1000 µs)   ·   Y: ±1.3 s (PWM 70)   ·   "
+                         "boundary trigger 10 %")
 
-        # AUTO SWEEP
-        tk.Label(inner, text="▸ AUTO SWEEP", bg=C["panel"], fg=C["warn"],
-                 font=FONT_TITLE).pack(anchor="w", pady=(0, 4))
-        tk.Label(inner, text="X: ±0.4mm (1000µs)  |  Y: ±1.3s (PWM70)  |  Boundary: 10%",
-                 bg=C["panel"], fg=C["accent"], font=FONT_SMALL).pack(anchor="w", pady=4)
-
-        btn_row = tk.Frame(inner, bg=C["panel"])
-        btn_row.pack(fill="x", pady=(2, 6))
+        btn_row = tk.Frame(box, bg=C["panel"])
+        btn_row.pack(fill="x", pady=(0, 6))
         self.btn_autosweep = tk.Button(
-            btn_row, text="▶ Start", command=self._start_autosweep,
+            btn_row, text="▶ Start sweep", command=self._start_autosweep,
             bg=C["success"], fg="#0f1117", font=("Consolas", 10, "bold"),
-            relief="flat", padx=10, pady=4, cursor="hand2")
-        self.btn_autosweep.pack(side="left", padx=2)
+            relief="flat", padx=12, pady=5, cursor="hand2",
+            activebackground="#3aaa6a", activeforeground="white")
+        self.btn_autosweep.pack(side="left", padx=(0, 4))
         self.btn_stop_autosweep = tk.Button(
             btn_row, text="■ Stop", command=self._stop_autosweep,
             bg=C["danger"], fg="white", font=("Consolas", 10, "bold"),
-            relief="flat", padx=10, pady=4, cursor="hand2", state="disabled")
-        self.btn_stop_autosweep.pack(side="left", padx=2)
+            relief="flat", padx=12, pady=5, cursor="hand2", state="disabled",
+            activebackground="#c03030", activeforeground="white")
+        self.btn_stop_autosweep.pack(side="left", padx=4)
 
         self._autosweep_status = tk.StringVar(value="Ready")
-        tk.Label(inner, textvariable=self._autosweep_status, bg=C["panel"],
-                 fg=C["muted"], font=FONT_SMALL).pack(anchor="w", pady=(0, 2))
+        tk.Label(btn_row, textvariable=self._autosweep_status, bg=C["panel"],
+                 fg=C["text"], font=FONT_SMALL).pack(side="left", padx=12)
 
         self._autosweep_timer_var = tk.StringVar(value="")
-        tk.Label(inner, textvariable=self._autosweep_timer_var, bg=C["panel"],
-                 fg=C["accent"], font=FONT_SMALL).pack(anchor="w", pady=(0, 10))
+        tk.Label(box, textvariable=self._autosweep_timer_var, bg=C["panel"],
+                 fg=C["accent"], font=FONT_LABEL).pack(anchor="w")
 
-        tk.Frame(inner, bg=C["border"], height=1).pack(fill="x", pady=8)
+        # ── live stitching feedback (mirrors the mosaic panel) ───────────────
+        stitch = self._card(parent, "LIVE STITCH", C["accent2"],
+                            "every saved frame is stitched as it arrives; "
+                            "blurry / duplicate frames are rejected")
+        self._sweep_stitch_var = tk.StringVar(
+            value="waiting for the first stitched frame")
+        tk.Label(stitch, textvariable=self._sweep_stitch_var, bg=C["panel"],
+                 fg=C["text"], font=FONT_LABEL).pack(anchor="w", pady=(0, 4))
+        self._last_stitch_var = tk.StringVar(value="—")
+        self._last_stitch_label = tk.Label(
+            stitch, textvariable=self._last_stitch_var, bg=C["panel"],
+            fg=C["muted"], font=FONT_SMALL, anchor="w")
+        self._last_stitch_label.pack(fill="x", pady=(0, 6))
 
-        # SIAMESE RLHF & AUTO-FOCUS
-        tk.Label(inner, text="▸ SIAMESE RLHF & AUTO-FOCUS", bg=C["panel"],
-                 fg=C["warn"], font=FONT_TITLE).pack(anchor="w", pady=(0, 4))
+        actions = tk.Frame(stitch, bg=C["panel"])
+        actions.pack(fill="x")
+        self._make_btn(actions, "Save snapshot now",
+                       self._stitch_snapshot).pack(side="left", padx=(0, 4))
+        self._make_btn(actions, "Open output folder",
+                       self._open_mosaic_folder).pack(side="left")
 
-        r1 = tk.Frame(inner, bg=C["panel"])
+        row = tk.Frame(parent, bg=C["bg"])
+        row.pack(fill="x", padx=2)
+        self._build_motion_detector_panel(row)
+        self._build_boundary_detector_panel(row)
+
+    # ── Tab: Focus ────────────────────────────────────────────────────────────
+
+    def _build_tab_focus(self, parent):
+        box = self._card(parent, "SIAMESE RLHF — FOCUS TRAINING", C["warn"],
+                         "set a baseline frame, nudge Z, then label which frame "
+                         "looks sharper")
+
+        r1 = tk.Frame(box, bg=C["panel"])
         r1.pack(fill="x", pady=2)
         self._make_btn(r1, "1. Set Frame A (Baseline)",
                        self._set_frame_a).pack(side="left")
@@ -888,17 +1180,17 @@ class MotorControlApp(tk.Tk):
         tk.Label(r1, text="  Auto (ms):", bg=C["panel"], fg=C["muted"],
                  font=FONT_SMALL).pack(side="left")
         self.auto_a_ms_var = tk.StringVar(value="0")
-        tk.Entry(r1, textvariable=self.auto_a_ms_var, width=5, bg=C["surface"],
-                 fg=C["text"], insertbackground=C["text"], relief="flat",
-                 font=FONT_SMALL).pack(side="left")
+        tk.Entry(r1, textvariable=self.auto_a_ms_var, width=5,
+                 bg=C["surface"], fg=C["text"], insertbackground=C["text"],
+                 relief="flat", font=FONT_SMALL).pack(side="left")
 
-        r2 = tk.Frame(inner, bg=C["panel"])
-        r2.pack(fill="x", pady=2)
-        tk.Label(r2, text="2. Move Z, then train: ", bg=C["panel"], fg=C["text"],
-                 font=FONT_SMALL).pack(side="left")
+        r2 = tk.Frame(box, bg=C["panel"])
+        r2.pack(fill="x", pady=(6, 2))
+        tk.Label(r2, text="2. Move Z, then train:", bg=C["panel"],
+                 fg=C["text"], font=FONT_SMALL).pack(side="left", padx=(0, 6))
         self._make_btn(r2, "B is Sharper (+)", lambda: self._train_siamese(1.0),
                        bg=C["success"]).pack(side="left", padx=2)
-        self._make_btn(r2, "B is Blurrier (-)", lambda: self._train_siamese(0.0),
+        self._make_btn(r2, "B is Blurrier (−)", lambda: self._train_siamese(0.0),
                        bg=C["danger"]).pack(side="left", padx=2)
         tk.Label(r2, text=" LR:", bg=C["panel"], fg=C["muted"],
                  font=FONT_SMALL).pack(side="left", padx=(6, 2))
@@ -907,45 +1199,141 @@ class MotorControlApp(tk.Tk):
                  fg=C["text"], insertbackground=C["text"], relief="flat",
                  font=FONT_SMALL).pack(side="left")
 
-        # AF step sizes: C=coarse, M=medium, F=fine (Z steps), D=settle delay (s)
+        af = self._card(parent, "AUTO-FOCUS Z", C["accent"],
+                        "coarse → fine hill climb on the focus score")
+        # C=coarse, M=medium, F=fine (Z steps), D=settle delay (s)
         self.af_y_c_var, self.af_y_m_var, self.af_y_f_var, self.af_y_d_var = \
             (tk.StringVar(value=v) for v in ("400", "200", "100", "0.1"))
         self.af_x_c_var, self.af_x_m_var, self.af_x_f_var, self.af_x_d_var = \
             (tk.StringVar(value=v) for v in ("400", "200", "100", "0.1"))
-        self._build_af_row(inner, "AF Y-Shifts:", C["warn"],
-                           (self.af_y_c_var, self.af_y_m_var, self.af_y_f_var, self.af_y_d_var))
-        self._build_af_row(inner, "AF X-Shifts:", C["accent2"],
-                           (self.af_x_c_var, self.af_x_m_var, self.af_x_f_var, self.af_x_d_var))
+        self._build_af_row(af, "AF Y-Shifts:", C["warn"],
+                           (self.af_y_c_var, self.af_y_m_var,
+                            self.af_y_f_var, self.af_y_d_var))
+        self._build_af_row(af, "AF X-Shifts:", C["accent2"],
+                           (self.af_x_c_var, self.af_x_m_var,
+                            self.af_x_f_var, self.af_x_d_var))
+        self.btn_af = tk.Button(
+            af, text="🎯 Auto-Focus Z", command=self._start_autofocus,
+            bg=C["accent"], fg="#0f1117", font=("Consolas", 10, "bold"),
+            relief="flat", padx=12, pady=5, cursor="hand2")
+        self.btn_af.pack(anchor="w", pady=(8, 0))
 
-        self.btn_af = tk.Button(inner, text="🎯 Auto-Focus Z", command=self._start_autofocus,
-                                bg=C["accent"], fg="#0f1117", font=("Consolas", 10, "bold"),
-                                relief="flat", padx=10, pady=4, cursor="hand2")
-        self.btn_af.pack(anchor="w", pady=4)
+        model = self._card(parent, "FOCUS MODEL", C["success"])
+        self._model_status_var = tk.StringVar(value=self._model_status_text())
+        tk.Label(model, textvariable=self._model_status_var, bg=C["panel"],
+                 fg=C["text"], font=FONT_SMALL, anchor="w",
+                 justify="left").pack(fill="x", pady=(0, 4))
+        tk.Label(model, text=f"file: {os.path.basename(MODEL_PATH)}",
+                 bg=C["panel"], fg=C["muted"], font=FONT_SMALL).pack(anchor="w")
+        self._make_btn(model, "Reload model", self._reload_model).pack(
+            anchor="w", pady=(6, 0))
 
-        tk.Frame(inner, bg=C["border"], height=1).pack(fill="x", pady=8)
+    def _model_status_text(self) -> str:
+        """Human-readable state of the Siamese focus model."""
+        if not HAS_TORCH:
+            return "PyTorch not installed — focus scoring disabled"
+        if AI_MODEL is None:
+            exists = os.path.exists(MODEL_PATH)
+            return ("not loaded — file missing" if not exists
+                    else "not loaded yet (loads on first use)")
+        try:
+            params = sum(p.numel() for p in AI_MODEL.parameters())
+            return f"loaded · {params:,} params · device {AI_DEVICE}"
+        except Exception:
+            return "loaded"
 
-        # CALIBRATION
-        tk.Label(inner, text="▸ CALIBRATION", bg=C["panel"], fg=C["accent2"],
-                 font=FONT_TITLE).pack(anchor="w", pady=(0, 4))
+    def _reload_model(self):
+        global _ai_load_attempted
+        _ai_load_attempted = False
+        self._log("[AI] reloading focus model…")
+        init_ai()
+        self._model_status_var.set(self._model_status_text())
+        self._log(f"[AI] {self._model_status_text()}")
+
+    # ── Tab: Manual ───────────────────────────────────────────────────────────
+
+    def _build_tab_manual(self, parent):
+        row1 = tk.Frame(parent, bg=C["bg"])
+        row1.pack(fill="x", padx=2, pady=(6, 0))
+
+        self._build_axis_panel(
+            row1, "M1 — Z AXIS", tag="Z",
+            modes=("mm", "steps"), default_mode="mm", default_val="1.0",
+            to_steps=lambda v, m: mm_to_z_steps(v) if m == "mm" else int(v),
+            describe=lambda v, m: (f"= {mm_to_z_steps(v):,} pulses" if m == "mm"
+                                   else f"= {int(v):,} pulses (direct)"),
+            mover=move_z, buttons=[("▲ +", 1, "+"), ("▼ −", 0, "-")])
+
+        self._build_axis_panel(
+            row1, "M3 — X AXIS", tag="X",
+            modes=("mm", "steps"), default_mode="mm", default_val="1.0",
+            to_steps=lambda v, m: mm_to_x_steps(v) if m == "mm" else int(v),
+            describe=lambda v, m: (f"= {mm_to_x_steps(v):,} pulses" if m == "mm"
+                                   else f"= {int(v):,} pulses (direct)"),
+            mover=move_x, buttons=[("◀ −", 0, "-"), ("+ ▶", 1, "+")])
+
+        self._build_axis_panel(
+            row1, "M2 — ROTATION", tag="R",
+            modes=("steps", "degrees"), default_mode="steps", default_val="1600",
+            to_steps=lambda v, m: (int(v) if m == "steps"
+                                   else degrees_to_r_steps(v)),
+            describe=lambda v, m: (
+                f"= {int(v):,} pulses = {v * DEGREES_PER_STEP:.2f}°"
+                if m == "steps" else
+                f"= {degrees_to_r_steps(v):,} pulses ({v:.2f}°)"),
+            mover=move_r, buttons=[("↻ CW", 1, "CW"), ("↺ CCW", 0, "CCW")])
+
+        row2 = tk.Frame(parent, bg=C["bg"])
+        row2.pack(fill="x", padx=2)
+        self._build_actuator_panel(row2)
+        self._build_speed_panel(row2)
+
+        self._build_cmd_bar(parent)
+
+    # ── Tab: Calibration ──────────────────────────────────────────────────────
+
+    def _build_tab_calibration(self, parent):
+        box = self._card(parent, "CALIBRATION", C["accent2"],
+                         "drive X left and Y up to the blade's top-left corner "
+                         "before a sweep")
         self.btn_go_start = tk.Button(
-            inner, text="↖ Go to Starting Point", command=self._start_go_to_starting_point,
+            box, text="↖ Go to Starting Point",
+            command=self._start_go_to_starting_point,
             bg=C["accent2"], fg="#0f1117", font=("Consolas", 10, "bold"),
-            relief="flat", padx=10, pady=4, cursor="hand2")
-        self.btn_go_start.pack(anchor="w", pady=2)
+            relief="flat", padx=12, pady=5, cursor="hand2")
+        self.btn_go_start.pack(anchor="w", pady=(0, 6))
         self._gsp_status = tk.StringVar(value="Ready")
-        tk.Label(inner, textvariable=self._gsp_status, bg=C["panel"],
-                 fg=C["muted"], font=FONT_SMALL).pack(anchor="w", pady=(0, 10))
+        tk.Label(box, textvariable=self._gsp_status, bg=C["panel"],
+                 fg=C["muted"], font=FONT_SMALL).pack(anchor="w")
 
-        tk.Frame(inner, bg=C["border"], height=1).pack(fill="x", pady=8)
+    # ── Tab: Log ──────────────────────────────────────────────────────────────
 
-        # LOG
-        tk.Label(inner, text="▸ LOG", bg=C["panel"], fg=C["accent"],
-                 font=FONT_TITLE).pack(anchor="w")
+    def _build_tab_log(self, parent):
+        holder = tk.Frame(parent, bg=C["bg"])
+        holder.pack(fill="both", expand=True, pady=6, padx=4)
+
+        hdr = tk.Frame(holder, bg=C["panel"])
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="▸ LOG", bg=C["panel"], fg=C["accent"],
+                 font=FONT_TITLE).pack(side="left", padx=6, pady=4)
+        self._make_btn(hdr, "Clear", self._clear_log).pack(side="right", padx=4)
+
+        wrap = tk.Frame(holder, bg=C["border"], padx=1, pady=1)
+        wrap.pack(fill="both", expand=True, pady=(2, 0))
         self._log_text = scrolledtext.ScrolledText(
-            inner, height=5, bg=C["surface"], fg=C["text"],
+            wrap, height=10, bg=C["surface"], fg=C["text"],
             insertbackground=C["text"], relief="flat", font=FONT_SMALL,
-            state="disabled", wrap="word")
-        self._log_text.pack(fill="both", expand=True, pady=4)
+            state="disabled", wrap="word", padx=8, pady=6)
+        self._log_text.pack(fill="both", expand=True)
+        self._log_text.tag_configure("warn", foreground=C["warn"])
+        self._log_text.tag_configure("error", foreground=C["danger"])
+        self._log_text.tag_configure("stitch", foreground=C["accent2"])
+        self._log_text.tag_configure("ok", foreground=C["success"])
+
+    def _clear_log(self):
+        self._log_text.configure(state="normal")
+        self._log_text.delete("1.0", "end")
+        self._log_text.configure(state="disabled")
 
     def _build_af_row(self, parent, label, fg, variables):
         row = tk.Frame(parent, bg=C["panel"])
@@ -1008,12 +1396,12 @@ class MotorControlApp(tk.Tk):
             return
 
         def worker():
-            self.after(0, lambda: self.btn_af.configure(
+            self._post( lambda: self.btn_af.configure(
                 state="disabled", text="⏳ Focusing..."))
             try:
                 self._autofocus(steps, delay)
             finally:
-                self.after(0, lambda: self.btn_af.configure(
+                self._post( lambda: self.btn_af.configure(
                     state="normal", text="🎯 Auto-Focus Z"))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1123,6 +1511,7 @@ class MotorControlApp(tk.Tk):
                     LiveConfig(**LIVE_STITCH_CONFIG),
                     out_prefix=os.path.join(
                         out_dir, f"live_{time.strftime('%Y%m%d_%H%M%S')}"),
+                    on_decision=self._on_stitch_decision,
                     log=lambda m: self._log(m))
             meta = {"file": filename}
             self._stitcher.submit(frame, filename.rsplit(".", 1)[0], meta)
@@ -1165,6 +1554,10 @@ class MotorControlApp(tk.Tk):
         if self._autosweep_running:
             return
         self._log("[SWEEP] Starting boundary-based autonomous scan")
+        if self._stitcher is not None:
+            self._stitch_finalize()      # don't mix two runs in one mosaic
+        self._sweep_stitch_var.set("waiting for the first stitched frame")
+        self._last_stitch_var.set("—")
         self.btn_autosweep.configure(state="disabled")
         self.btn_stop_autosweep.configure(state="normal")
         self._autosweep_running = True
@@ -1229,7 +1622,7 @@ class MotorControlApp(tk.Tk):
                 if pct is not None:
                     self._log(
                         f"[SWEEP] {edge.title()} boundary: {pct[edge]:.1f}%")
-                    self.after(0, lambda p=pct[edge], e=edge:
+                    self._post( lambda p=pct[edge], e=edge:
                                self._autosweep_status.set(f"{e.title()}: {p:.1f}%"))
                     if pct[edge] > edge_pct:
                         self._log(f"[SWEEP] ✓ {edge.title()} boundary detected "
@@ -1263,7 +1656,7 @@ class MotorControlApp(tk.Tk):
                 if pct["right"] > RIGHT_PCT:
                     self._log(
                         "[SWEEP] ✓ Right boundary reached — scan complete")
-                    self.after(0, lambda: self._autosweep_status.set(
+                    self._post( lambda: self._autosweep_status.set(
                         "Right boundary reached - Done"))
                     return True
             return False
@@ -1274,7 +1667,7 @@ class MotorControlApp(tk.Tk):
             self._autosweep_column_start_time = column_start
             self._autosweep_column_num = column
             self._log(f"\n[SWEEP] === Column {column} ===")
-            self.after(0, lambda c=column, e=elapsed:
+            self._post( lambda c=column, e=elapsed:
                        self._autosweep_status.set(f"Column {c} | {e // 60}m {e % 60}s"))
 
             if not y_sweep("down", "lower", LOWER_PCT, None, "Ydown"):
@@ -1317,12 +1710,12 @@ class MotorControlApp(tk.Tk):
             self._log(
                 f"[SWEEP]   Average per column: {avg // 60}m {avg % 60}s")
         self._autosweep_running = False
-        self.after(0, lambda e=elapsed: self._autosweep_status.set(
+        self._post( lambda e=elapsed: self._autosweep_status.set(
             f"Complete | {e // 60}m {e % 60}s"))
-        self.after(0, lambda e=elapsed: self._autosweep_timer_var.set(
+        self._post( lambda e=elapsed: self._autosweep_timer_var.set(
             f"⏱ Final total: {e // 60}m {e % 60}s"))
-        self.after(0, lambda: self.btn_autosweep.configure(state="normal"))
-        self.after(0, lambda: self.btn_stop_autosweep.configure(
+        self._post( lambda: self.btn_autosweep.configure(state="normal"))
+        self._post( lambda: self.btn_stop_autosweep.configure(
             state="disabled"))
 
     # ── Calibration: Go to Starting Point ─────────────────────────────────────
@@ -1336,7 +1729,7 @@ class MotorControlApp(tk.Tk):
     def _gsp_worker(self):
         """Drive X left then Y up to the blade's top-left corner."""
         def set_status(text):
-            self.after(0, lambda: self._gsp_status.set(text))
+            self._post( lambda: self._gsp_status.set(text))
 
         try:
             x_steps = mm_to_x_steps(0.4)
@@ -1400,7 +1793,7 @@ class MotorControlApp(tk.Tk):
             self._log(f"[GSP] Error: {e}")
             set_status(f"Error: {e}")
         finally:
-            self.after(0, lambda: self.btn_go_start.configure(
+            self._post( lambda: self.btn_go_start.configure(
                 state="normal", text="↖ Go to Starting Point"))
 
     # ── Camera Feed ───────────────────────────────────────────────────────────
@@ -1464,7 +1857,7 @@ class MotorControlApp(tk.Tk):
             if auto_ms > 0 and (now - last_auto_time) * 1000 >= auto_ms:
                 with self._frame_lock:
                     self._frame_a_bgr = frame.copy()
-                self.after(0, lambda ms=auto_ms: self._frame_a_status.set(
+                self._post( lambda ms=auto_ms: self._frame_a_status.set(
                     f" Frame A: Auto ({ms}ms)"))
                 last_auto_time = now
 
@@ -1540,6 +1933,8 @@ class MotorControlApp(tk.Tk):
                 self._feed_status_var.set(
                     f"Live  ·  {target_w}×{target_h}  ·  {self._feed_fps:.1f} FPS"
                     f"  ·  Siamese: {pred_str}")
+                if hasattr(self, "_sb_feed_var"):
+                    self._sb_feed_var.set(f"feed {self._feed_fps:.0f} fps")
             else:
                 self._feed_status_var.set(
                     "pip install Pillow to enable embedded feed")
@@ -1579,7 +1974,7 @@ class MotorControlApp(tk.Tk):
 
         def _do():
             ok, resp = http_get(cmd, log_fn=self._log)
-            self.after(0, lambda: self._cmd_resp_var.set(f"→ {resp[:60]}"))
+            self._post( lambda: self._cmd_resp_var.set(f"→ {resp[:60]}"))
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -1618,14 +2013,29 @@ class MotorControlApp(tk.Tk):
     def _log(self, message: str):
         self._log_queue.put(message)
 
+    @staticmethod
+    def _log_tag(line: str) -> str:
+        """Severity tag for a log line — colours the log without extra plumbing."""
+        low = line.lower()
+        if ("⛔" in line or "error" in low or "failed" in low
+                or "[live] drop" in low):
+            return "error"
+        if "[live]" in low or "[stitch]" in low:
+            return "stitch"
+        if "[sweep] ✓" in low or "complete" in low or "[ai] successfully" in low:
+            return "ok"
+        if "warn" in low or "timeout" in low or "[af] passed" in low:
+            return "warn"
+        return ""
+
     def _poll_log_queue(self):
         """200 ms loop — moves queued messages into the log panel."""
         drained = False
         self._log_text.configure(state="normal")
         try:
             while True:
-                self._log_text.insert(
-                    "end", self._log_queue.get_nowait() + "\n")
+                line = self._log_queue.get_nowait()
+                self._log_text.insert("end", line + "\n", self._log_tag(line))
                 drained = True
         except queue.Empty:
             pass
@@ -1644,7 +2054,7 @@ class MotorControlApp(tk.Tk):
         def _do_ping():
             self._log("[PING] Sending ping…")
             self._connected = ping_esp32(self._log)
-            self.after(0, self._update_connection_indicator)
+            self._post( self._update_connection_indicator)
         threading.Thread(target=_do_ping, daemon=True).start()
 
     def _apply_ip(self, event=None):
@@ -1660,6 +2070,10 @@ class MotorControlApp(tk.Tk):
         else:
             self.conn_dot.configure(fg=C["danger"])
             self.conn_label.configure(text="DISCONNECTED", fg=C["muted"])
+        if hasattr(self, "_sb_conn_var"):
+            self._sb_conn_var.set("● ONLINE" if self._connected else "● OFFLINE")
+            self._sb_conn_label.configure(
+                fg=C["success"] if self._connected else C["danger"])
 
     def _emergency_stop(self):
         self._log("⛔ EMERGENCY STOP SENT")
@@ -1669,6 +2083,12 @@ class MotorControlApp(tk.Tk):
     def _on_close(self):
         self._feed_stop_evt.set()
         self._autosweep_stop_evt.set()
+        # Finalise the mosaic in the background: stopping the stitcher joins its
+        # worker, which must not freeze the window or be skipped entirely (that
+        # would silently drop everything stitched so far).  _stitch_finalize
+        # only touches the log queue, not widgets, so it is thread-safe here.
+        if self._stitcher is not None:
+            threading.Thread(target=self._stitch_finalize, daemon=True).start()
         self.destroy()
 
 

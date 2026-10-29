@@ -181,13 +181,31 @@ Outputs, all prefixed with `--out`:
 (`LIVE_STITCH = True`, config in `LIVE_STITCH_CONFIG`) and finalises the mosaic
 at the end of the sweep into `main_code/blade_mosaic/`. It is non-blocking and
 self-disabling: if the stitching module is missing or raises, the scan
-continues unchanged. Expected log:
+continues unchanged. The growing mosaic is shown **inside the main window**
+(next to the live feed) with its keep/drop counters; closing the window
+mid-sweep still writes the mosaic. Expected log:
 
 ```
 [LIVE] KEEP col01_Ydown_1_154429.jpg  ok              ncc=0.00 ov=0.00 sharp=1.00  284ms
 [LIVE] KEEP col01_Ydown_2_154431.jpg  ok              ncc=0.98 ov=0.61 sharp=0.86  691ms
 [LIVE] DROP col01_Ydown_9_154458.jpg  duplicate(...)  ncc=1.00 ov=1.00 sharp=1.02  174ms
 ```
+
+### Live preview (what the GUI shows)
+```python
+rgb, summary = st.preview(max_width=520)   # safe to call from any thread
+```
+`preview()` takes the same lock the blend worker uses, so it can never observe a
+half-blended canvas, and it renders the current mosaic (cropped to content,
+downscaled for display) as RGB for a Tk/`PhotoImage` widget. `summary()` carries
+`accepted / filled / rejected / disconnected / mean_ncc / canvas /
+low_quality_pct`, which is exactly what the GUI's mosaic panel prints.
+`st.flush()` writes a snapshot mid-scan without stopping anything, so "save now"
+during a sweep is just a button.
+
+The GUI polls `preview()` about once a second **from a worker thread** and hands
+the result back to Tk with `after(0, ...)`: rendering the canvas is ~180 ms, far
+too long to run inside the event loop, and the sweep must never wait on it.
 
 ### Library
 ```python

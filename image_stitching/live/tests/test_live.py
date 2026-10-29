@@ -191,6 +191,82 @@ def test_submit_is_asynchronous_and_finalize_writes_outputs(tmp_path):
     assert Path(str(tmp_path / "run_report.txt")).exists()
 
 
+# ── live preview (what the GUI polls) ────────────────────────────────────────
+def test_preview_empty_returns_none(tmp_path):
+    st = _pipeline(tmp_path)
+    try:
+        rgb, summary = st.preview(120)
+        assert rgb is None
+        assert summary["accepted"] == 0
+    finally:
+        st.stop()
+
+
+def test_preview_returns_scaled_rgb_snapshot(tmp_path):
+    img = texture()
+    # make the frame warm (BGR: little blue) so a BGR/RGB mix-up is detectable
+    warm = img.copy()
+    warm[:, :, 0] = warm[:, :, 0] // 4
+    st = _pipeline(tmp_path)
+    try:
+        st.process(crop(warm, 0), "a")
+        st.process(crop(warm, 150), "b")
+        rgb, summary = st.preview(120)
+        assert rgb is not None and rgb.dtype == np.uint8 and rgb.ndim == 3
+        assert rgb.shape[1] <= 120, rgb.shape
+        assert summary["accepted"] >= 2, summary
+        b, g, r = (int(v) for v in crop(warm, 0)[0, 0])
+        assert abs(int(rgb[0, 0, 0]) - r) < 12, (rgb[0, 0], (r, g, b))
+        assert abs(int(rgb[0, 0, 2]) - b) < 12, (rgb[0, 0], (r, g, b))
+    finally:
+        st.stop()
+
+
+def test_preview_is_safe_while_frames_are_being_stitched(tmp_path):
+    """The GUI polls on its own thread while the worker blends."""
+    import threading
+    img = texture()
+    st = LiveStitcher(LiveConfig(flush_every=0), out_prefix=str(tmp_path / "run"),
+                      log=no_log)
+    errors, shapes = [], []
+
+    def poll():
+        for _ in range(25):
+            try:
+                rgb, _ = st.preview(60)
+                if rgb is not None:
+                    shapes.append(rgb.shape)
+            except Exception as exc:            # noqa: BLE001
+                errors.append(exc)
+
+    try:
+        poller = threading.Thread(target=poll)
+        poller.start()
+        for i, dy in enumerate((0, 150, 300, 450)):
+            st.submit(crop(img, dy), f"f{i}")
+        st.wait_idle(60)
+        poller.join(10)
+        assert not errors, errors
+        assert all(s[1] <= 60 for s in shapes)
+        assert st.mosaic.count >= 3
+    finally:
+        st.stop()
+
+
+def test_flush_writes_a_snapshot_mid_scan(tmp_path):
+    img = texture()
+    st = _pipeline(tmp_path)
+    try:
+        st.process(crop(img, 0), "a")
+        st.process(crop(img, 150), "b")
+        paths = st.flush()
+        assert Path(paths["png"]).exists()
+        # the scan can keep going after a manual snapshot
+        assert st.process(crop(img, 300), "c").ok
+    finally:
+        st.stop()
+
+
 # ── real data (skipped when the sample scan is absent) ───────────────────────
 def _real_pairs(n=6):
     files = sorted(SCAN_DIR.glob("col01_Ydown_[0-9]*.jpg"))

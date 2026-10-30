@@ -141,6 +141,22 @@ class IncrementalMosaic:
         return img, mask
 
     # ── blending ────────────────────────────────────────────────────────────
+    def _warp_weight(self, weight: np.ndarray, frame_shape: tuple[int, int],
+                     m: np.ndarray, size: tuple[int, int],
+                     mask: np.ndarray) -> np.ndarray | None:
+        """Warp a per-pixel weight into canvas space next to its frame."""
+        w = np.asarray(weight, np.float32)
+        if w.shape[:2] != tuple(frame_shape):
+            w = cv2.resize(w, (frame_shape[1], frame_shape[0]),
+                           interpolation=cv2.INTER_LINEAR)
+        w = np.clip(w, 1e-3, 1.0)          # never a hard zero: keep gradients sane
+        scaled = self.cfg.accum_scale if hasattr(self.cfg, "accum_scale") else 1.0
+        if scaled != 1.0:
+            w = cv2.resize(w, None, fx=scaled, fy=scaled, interpolation=cv2.INTER_AREA)
+        out = cv2.warpAffine(w, m, size, flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT)
+        return np.clip(out, 1e-3, 1.0) * mask
+
     def _weight(self, mask: np.ndarray) -> np.ndarray:
         dist = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 3)
         return (np.minimum(dist, float(self.cfg.feather_px)) * mask).astype(np.float32)
@@ -176,13 +192,25 @@ class IncrementalMosaic:
         return small, to_mosaic @ inv
 
     def add(self, frame: np.ndarray, to_mosaic: np.ndarray,
-            empty_only: bool = False, low_quality: bool = False) -> AddResult:
+            empty_only: bool = False, low_quality: bool = False,
+            weight: np.ndarray | None = None) -> AddResult:
         """Blend a frame.  ``empty_only`` fills canvas holes without touching
         already-covered pixels (used for soft frames), and ``low_quality``
-        records those pixels in the QC mask."""
+        records those pixels in the QC mask.
+
+        ``weight`` is an optional per-pixel confidence in frame coordinates
+        (``HxW``, 0..1), typically from ``focus_engine.tile_weight_map`` or the
+        confidence map of a focus stack.  It multiplies the feathered edge
+        weight, so in an overlap the sharp frame wins the pixel and a blurred
+        region of an otherwise useful frame can no longer be baked into the
+        mosaic - the defect that made a band of the delivered image unusable.
+        """
         frame, to_mosaic = self._scaled(frame, to_mosaic)
         roi, size, m = self._roi(frame.shape, to_mosaic)
         warped, mask = self._warp(frame, m, size)
+        w_frame = None
+        if weight is not None:
+            w_frame = self._warp_weight(weight, frame.shape[:2], m, size, mask)
         known = self._wsum[roi] > 0
         total = float(mask.sum())
         new_area = float((mask & ~known).sum()) / total if total else 0.0
@@ -192,6 +220,8 @@ class IncrementalMosaic:
             if not mask.any():
                 return AddResult(0.0, gain, self._wsum.shape)
         w = self._weight(mask)
+        if w_frame is not None:
+            w = w * w_frame
         if gain != 1.0:
             warped = np.clip(warped.astype(np.float32) * gain, 0, 255).astype(np.uint8)
         # Blend only inside the frame's ROI, keeping temporaries frame-sized.

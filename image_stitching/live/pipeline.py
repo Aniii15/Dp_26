@@ -146,7 +146,8 @@ class LiveStitcher:
 
     # ── public API ──────────────────────────────────────────────────────────
     def submit(self, frame: np.ndarray, tag: str | None = None,
-               meta: dict | None = None) -> bool:
+               meta: dict | None = None,
+               weight: np.ndarray | None = None) -> bool:
         """Queue a captured frame.  Returns False if backpressure dropped it."""
         self._counter += 1
         tag = tag or f"frame_{self._counter:04d}"
@@ -156,7 +157,8 @@ class LiveStitcher:
         with self._lock:
             self._pending += 1
         try:
-            self._queue.put((self._counter, tag, frame.copy(), meta or {}),
+            w = None if weight is None else np.asarray(weight, np.float32)
+            self._queue.put((self._counter, tag, frame.copy(), meta or {}, w),
                             timeout=2.0)
             return True
         except queue.Full:
@@ -167,7 +169,8 @@ class LiveStitcher:
             return False
 
     def process(self, frame: np.ndarray, tag: str, meta: dict | None = None,
-                index: int | None = None, record: bool = True) -> Decision:
+                index: int | None = None, record: bool = True,
+                weight: np.ndarray | None = None) -> Decision:
         """Process one frame synchronously and account for it.
 
         Recording happens here rather than in the worker so that a caller using
@@ -175,13 +178,14 @@ class LiveStitcher:
         bookkeeping as the queue: ``summary()`` and the CSV stay consistent with
         what was actually stitched.
         """
-        d = self._process(frame, tag, meta, index)
+        d = self._process(frame, tag, meta, index, weight=weight)
         if record:
             self._record(d)
         return d
 
     def _process(self, frame: np.ndarray, tag: str, meta: dict | None = None,
-                 index: int | None = None) -> Decision:
+                 index: int | None = None,
+                 weight: np.ndarray | None = None) -> Decision:
         """The actual decision logic for one frame."""
         t0 = time.perf_counter()
         cfg = self.cfg
@@ -215,7 +219,7 @@ class LiveStitcher:
         # ── 2. first frame becomes the origin ───────────────────────────────
         if not self.nodes:
             pose = np.eye(3)
-            res = self._safe_add(frame, pose)
+            res = self._safe_add(frame, pose, weight=weight)
             if res is None:
                 d.reason = "canvas_full"
                 d.ms = (time.perf_counter() - t0) * 1000
@@ -332,7 +336,7 @@ class LiveStitcher:
             return reject(f"duplicate(new_area={new_area:.2f})")
 
         # ── 6. accept and blend ─────────────────────────────────────────────
-        res = self._safe_add(frame, pose)
+        res = self._safe_add(frame, pose, weight=weight)
         if res is None:
             return reject("canvas_full")
         self._accept(d, token, pose, frame.shape[:2], res)
@@ -459,12 +463,13 @@ class LiveStitcher:
         def run():
             while not self._stop.is_set() or not self._queue.empty():
                 try:
-                    idx, tag, frame, meta = self._queue.get(timeout=0.2)
+                    idx, tag, frame, meta, wt = self._queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
                 with self._lock:
                     try:
-                        d = self.process(frame, tag, meta, index=idx)
+                        d = self.process(frame, tag, meta, index=idx,
+                                         weight=wt)
                     except Exception as exc:
                         # One bad frame (or one exhausted canvas limit) must
                         # never kill the pipeline mid-scan.
@@ -525,8 +530,15 @@ class LiveStitcher:
                      "Lower accum_scale or raise max_canvas_px to continue.")
 
     def _safe_add(self, frame: np.ndarray, pose: np.ndarray,
+                  weight: np.ndarray | None = None,
                   **kw) -> AddResult | None:
-        """Blend, or give up cleanly if the canvas safety limit is reached."""
+        """Blend, or give up cleanly if the canvas safety limit is reached.
+
+        ``weight`` (per-pixel focus confidence) is only honoured for pixels that
+        are *allowed* to overwrite, i.e. not for hole-filling soft frames.
+        """
+        if weight is not None and not kw.get("empty_only"):
+            kw["weight"] = weight
         try:
             return self.mosaic.add(frame, pose, **kw)
         except MemoryError as exc:

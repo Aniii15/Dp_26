@@ -31,6 +31,11 @@ except ImportError:
     HAS_PIL = False
 
 try:
+    import focus_engine as _focus_engine
+except ImportError:              # optional: only needed for region-wise AF
+    _focus_engine = None
+
+try:
     import torch
     import torch.nn as nn
     import torchvision.transforms as transforms
@@ -67,6 +72,29 @@ UPPER_BOUNDARY_THRESHOLD = 50  # stricter threshold for upper-boundary checks
 # also pushed to the streaming stitcher in image_stitching/live, which blends it
 # into a growing mosaic and rejects blurry/duplicate/unregisterable frames as
 # they arrive.  Set to False to keep the original save-only behaviour.
+# Autofocus engine.  "region" = region-wise wide-range scan (focus_engine.py):
+# scores a tile grid, searches the whole Z travel, extends the window when the
+# peak sits on an edge, and can bracket+stack.  "cnn" = the original Siamese
+# hill climb, kept because it is trained in-house and still useful for small
+# corrections near focus.
+FOCUS_MODE = "region"
+FOCUS_CONFIG = {
+    "range_steps": 6000,      # 3.75 mm of travel per search window
+    "coarse_steps": 200,      # 0.125 mm
+    "fine_steps": 50,         # 31 um
+    "max_extensions": 2,      # window may grow twice when the peak is at an edge
+    "z_travel_limit": 24000,  # 15 mm either way: refuse to drive further
+    "settle_s": 0.25,
+    "backlash_steps": 0,      # set to ~2x the measured backlash if Z is sloppy
+    "in_focus_ratio": 0.90,   # tile counts as focused at 90 % of its own best
+}
+# Bracket + fuse a Z-stack whenever a single Z cannot make the whole frame sharp.
+FOCUS_STACKING = True
+FOCUS_STACK_SAMPLES = 5
+# Feed a per-pixel focus weight to the stitcher, so a blurred region loses the
+# blend to a sharp neighbour instead of being baked into the mosaic.
+STITCH_FOCUS_WEIGHTS = True
+
 LIVE_STITCH = True
 LIVE_STITCH_CONFIG = {
     "flush_every": 10,      # write a partial mosaic every N accepted frames
@@ -415,6 +443,9 @@ class MotorControlApp(tk.Tk):
         self._stitcher = None
         self._stitcher_dir = None
         self._mosaic_pending = False     # a preview fetch is in flight
+        self._focus_trend = None         # FocusTrend, created with the engine
+        self._focus_result = None        # last FocusResult, for the Focus tab
+        self._focus_ref = 0.0            # running sharpness reference for weights
         self._ui_queue = queue.Queue()   # work for the Tk thread (thread-safe)
         self._mosaic_photo = None        # keeps the Tk image alive
         self._vis_h = 300                # height of the feed|mosaic row
@@ -1199,24 +1230,86 @@ class MotorControlApp(tk.Tk):
                  fg=C["text"], insertbackground=C["text"], relief="flat",
                  font=FONT_SMALL).pack(side="left")
 
-        af = self._card(parent, "AUTO-FOCUS Z", C["accent"],
-                        "coarse → fine hill climb on the focus score")
-        # C=coarse, M=medium, F=fine (Z steps), D=settle delay (s)
+        af = self._card(parent, "AUTOFOCUS", C["accent"],
+                        "region-wise wide-range scan: scores a tile grid, "
+                        "searches the whole Z travel and extends the window "
+                        "instead of assuming the peak is inside it")
+
+        # engine selection
+        mode_row = tk.Frame(af, bg=C["panel"])
+        mode_row.pack(fill="x", pady=(0, 6))
+        tk.Label(mode_row, text="Engine:", bg=C["panel"], fg=C["text"],
+                 font=FONT_SMALL).pack(side="left", padx=(0, 6))
+        self._af_mode_var = tk.StringVar(
+            value="Region-wise (recommended)" if FOCUS_MODE == "region"
+            else "CNN hill climb (legacy)")
+        for label in ("Region-wise (recommended)", "CNN hill climb (legacy)"):
+            tk.Radiobutton(mode_row, text=label, value=label,
+                           variable=self._af_mode_var, bg=C["panel"],
+                           fg=C["text"], selectcolor=C["surface"],
+                           activebackground=C["panel"],
+                           activeforeground=C["accent"], font=FONT_SMALL,
+                           highlightthickness=0).pack(side="left", padx=4)
+
+        # region-wise parameters
+        rw = tk.Frame(af, bg=C["panel"])
+        rw.pack(fill="x", pady=2)
+        self.af_range_var = tk.StringVar(value=str(FOCUS_CONFIG["range_steps"]))
+        self.af_ext_var = tk.StringVar(value=str(FOCUS_CONFIG["max_extensions"]))
+        self.af_limit_var = tk.StringVar(value=str(FOCUS_CONFIG["z_travel_limit"]))
+        self.af_backlash_var = tk.StringVar(
+            value=str(FOCUS_CONFIG.get("backlash_steps", 0)))
+        for label, var, width, suffix in (
+                ("Range:", self.af_range_var, 6, "steps"),
+                ("Extensions:", self.af_ext_var, 3, ""),
+                ("Travel limit:", self.af_limit_var, 6, "steps"),
+                ("Backlash:", self.af_backlash_var, 4, "steps")):
+            tk.Label(rw, text=f" {label}", bg=C["panel"], fg=C["muted"],
+                     font=FONT_SMALL).pack(side="left")
+            tk.Entry(rw, textvariable=var, width=width, bg=C["surface"],
+                     fg=C["text"], insertbackground=C["text"], relief="flat",
+                     font=FONT_SMALL).pack(side="left", padx=1)
+            if suffix:
+                tk.Label(rw, text=suffix, bg=C["panel"], fg=C["muted"],
+                         font=FONT_SMALL).pack(side="left", padx=(0, 6))
+
+        # per-axis step sizes (C = coarse search step, F = fine step, D = settle)
         self.af_y_c_var, self.af_y_m_var, self.af_y_f_var, self.af_y_d_var = \
-            (tk.StringVar(value=v) for v in ("400", "200", "100", "0.1"))
+            (tk.StringVar(value=v) for v in ("200", "100", "50", "0.25"))
         self.af_x_c_var, self.af_x_m_var, self.af_x_f_var, self.af_x_d_var = \
-            (tk.StringVar(value=v) for v in ("400", "200", "100", "0.1"))
+            (tk.StringVar(value=v) for v in ("200", "100", "50", "0.25"))
         self._build_af_row(af, "AF Y-Shifts:", C["warn"],
                            (self.af_y_c_var, self.af_y_m_var,
                             self.af_y_f_var, self.af_y_d_var))
         self._build_af_row(af, "AF X-Shifts:", C["accent2"],
                            (self.af_x_c_var, self.af_x_m_var,
                             self.af_x_f_var, self.af_x_d_var))
+        tk.Label(af, text="C = coarse step, M = medium, F = fine step, "
+                          "D = settle delay (s)",
+                 bg=C["panel"], fg=C["muted"], font=FONT_SMALL).pack(anchor="w")
+
+        btn_row = tk.Frame(af, bg=C["panel"])
+        btn_row.pack(fill="x", pady=(8, 0))
         self.btn_af = tk.Button(
-            af, text="🎯 Auto-Focus Z", command=self._start_autofocus,
+            btn_row, text="🎯 Auto-Focus Z", command=self._start_autofocus,
             bg=C["accent"], fg="#0f1117", font=("Consolas", 10, "bold"),
             relief="flat", padx=12, pady=5, cursor="hand2")
-        self.btn_af.pack(anchor="w", pady=(8, 0))
+        self.btn_af.pack(side="left")
+        self.btn_af_diag = tk.Button(
+            btn_row, text="📏 Measure depth of field",
+            command=self._diagnose_focus, bg=C["btn_bg"], fg=C["text"],
+            font=FONT_SMALL, relief="flat", padx=10, pady=5, cursor="hand2")
+        self.btn_af_diag.pack(side="left", padx=6)
+
+        self._af_result_var = tk.StringVar(value="not focused yet")
+        self._af_result_label = tk.Label(
+            af, textvariable=self._af_result_var, bg=C["panel"],
+            fg=C["muted"], font=FONT_LABEL, anchor="w", justify="left")
+        self._af_result_label.pack(fill="x", pady=(8, 2))
+        self._af_detail_var = tk.StringVar(value="")
+        tk.Label(af, textvariable=self._af_detail_var, bg=C["panel"],
+                 fg=C["muted"], font=FONT_SMALL, anchor="w", justify="left",
+                 wraplength=760).pack(fill="x")
 
         model = self._card(parent, "FOCUS MODEL", C["success"])
         self._model_status_var = tk.StringVar(value=self._model_status_text())
@@ -1406,8 +1499,171 @@ class MotorControlApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _autofocus(self, steps: list, delay: float):
-        """Coarse-to-fine hill climb on Z using the Siamese focus model."""
+    def _autofocus(self, steps: list | None = None, delay: float | None = None,
+                   hint: float | None = None, u: float | None = None,
+                   v: float | None = None, stack: bool | None = None):
+        """Bring the blade into focus, using the engine selected in the UI.
+
+        Returns a ``FocusResult`` for the region-wise engine, ``None`` for the
+        CNN climb.  Kept as one entry point so the sweep, the Auto-Focus button
+        and the diagnostics all behave identically.
+        """
+        if self._af_mode_var.get().startswith("Region"):
+            return self._autofocus_regions(hint=hint, u=u, v=v, stack=stack)
+        return self._autofocus_cnn(steps or [1600, 800, 400], delay or 2.0)
+
+    # ── Region-wise engine (the fix for curved blades) ────────────────────────
+
+    def _focus_cfg(self):
+        """Build a FocusConfig from the current UI values."""
+        if _focus_engine is None:
+            return None
+        def num(var, fallback):
+            try:
+                return float(var.get())
+            except (ValueError, AttributeError):
+                return fallback
+        base = dict(FOCUS_CONFIG)
+        base["range_steps"] = int(num(self.af_range_var, base["range_steps"]))
+        base["coarse_steps"] = int(num(self.af_y_c_var, base["coarse_steps"]))
+        base["fine_steps"] = int(num(self.af_y_f_var, base["fine_steps"]))
+        base["max_extensions"] = int(num(self.af_ext_var, base["max_extensions"]))
+        base["z_travel_limit"] = int(num(self.af_limit_var, base["z_travel_limit"]))
+        base["settle_s"] = num(self.af_y_d_var, base["settle_s"])
+        base["backlash_steps"] = int(num(self.af_backlash_var, 0))
+        return _focus_engine.FocusConfig(**base)
+
+    def _focus_runner(self, cfg, start_z: float = 0.0):
+        """An AutoFocus wired to this app's Z motor and camera feed."""
+        def move(delta: int):
+            # move_z takes *unsigned* steps plus a direction flag; handing it a
+            # signed value and dir=0 sends a negative step count to the ESP32.
+            move_z(abs(int(round(delta))), 1 if delta > 0 else 0)
+
+        def wait():
+            self._wait_motion_stop()
+
+        return _focus_engine.AutoFocus(
+            move, self._get_frame, cfg, wait=wait, log=self._log,
+            sleep=time.sleep, steps_per_mm=Z_STEPS_PER_MM, origin=start_z)
+
+    def _autofocus_regions(self, hint=None, u=None, v=None,
+                           stack=None) -> "object | None":
+        """Scan a wide Z range, score it per region, and say what it found."""
+        if _focus_engine is None:
+            self._log("[AF] focus_engine.py is missing — falling back to the CNN")
+            return self._autofocus_cnn([1600, 800, 400], 2.0)
+        if self._get_frame() is None:
+            self._log("[AF] No feed available, aborting autofocus")
+            return None
+
+        cfg = self._focus_cfg()
+        if cfg is None:
+            return None
+        runner = self._focus_runner(cfg)
+        try:
+            result = runner.run(z_hint=hint)
+        except _focus_engine.FocusError as exc:
+            self._log(f"[AF] Focus scan could not conclude: {exc}")
+            self._set_focus_status("no focus found", "danger")
+            return None
+        except Exception as exc:                       # noqa: BLE001
+            self._log(f"[AF] Error: {exc}")
+            return None
+
+        self._focus_result = result
+        self._last_focus_runner = runner
+        self._post(lambda r=result: self._show_focus_result(r))
+        if result.range_limited:
+            self._log("[AF] WARNING: the best sample was at the edge of the "
+                      "travel — the true focus may be outside the reachable range")
+        if self._focus_trend is None:       # stays set across sweeps/buttons
+            self._focus_trend = _focus_engine.FocusTrend()
+        if u is not None and v is not None:
+            self._focus_trend.add(u, v, result.z_peak)
+
+        do_stack = FOCUS_STACKING if stack is None else stack
+        if do_stack and result.needs_stacking:
+            self._log("[AF] depth spread exceeds depth of field — bracketing Z and "
+                      "stacking so the whole frame is sharp")
+            self._last_focus_stack = self._capture_focus_stack(runner, result)
+        else:
+            self._last_focus_stack = None
+        return result
+
+    def _capture_focus_stack(self, runner, result):
+        """Bracket around the focus and fuse it; returns (frame, weight) or None."""
+        try:
+            frames = runner.bracket(runner.position,
+                                    samples=FOCUS_STACK_SAMPLES)
+            if len(frames) < 2:
+                return None
+            comp, conf = _focus_engine.compose_focus_stack(
+                [f for _, f in frames], runner.cfg)
+            self._log(f"[AF] stacked {len(frames)} exposures "
+                      f"(span {runner.stack.depth_spread():.0f} steps)")
+            return comp, conf
+        except Exception as exc:                       # noqa: BLE001
+            self._log(f"[AF] stacking failed, using the single frame: {exc}")
+            return None
+
+    def _show_focus_result(self, result):
+        """Paint a FocusResult into the Focus tab."""
+        if not hasattr(self, "_af_result_var"):
+            return
+        self._af_result_var.set(result.summary(Z_STEPS_PER_MM))
+        self._af_detail_var.set("\n".join(
+            f"• {line}" for line in result.recommendation(Z_STEPS_PER_MM)))
+        colour = C["success"] if (result.bracketed
+                                  and result.in_focus_area >= 0.6) else C["warn"]
+        if not result.bracketed:
+            colour = C["danger"]
+        self._af_result_label.configure(fg=colour)
+
+    def _set_focus_status(self, text, colour="muted"):
+        if hasattr(self, "_af_result_var"):
+            self._af_result_var.set(text)
+            self._af_result_label.configure(fg=C[colour])
+
+    def _diagnose_focus(self):
+        """Scan Z and report the blade's depth profile — no scanning of the blade."""
+        def worker():
+            self._post(lambda: self.btn_af_diag.configure(
+                state="disabled", text="⏳ Measuring…"))
+            try:
+                if _focus_engine is None:
+                    self._log("[AF] focus_engine.py is missing")
+                    return
+                cfg = self._focus_cfg()
+                if cfg is None or self._get_frame() is None:
+                    self._log("[AF] no feed — cannot measure depth of field")
+                    return
+                runner = self._focus_runner(cfg)
+                result = runner.run()
+                self._focus_result = result
+                self._post(lambda r=result: self._show_focus_result(r))
+                self._log(f"[AF] depth of field {result.dof_steps:.0f} steps "
+                          f"({result.dof_steps / Z_STEPS_PER_MM:.3f} mm), "
+                          f"surface depth spread {result.depth_spread:.0f} steps "
+                          f"({result.depth_spread / Z_STEPS_PER_MM:.3f} mm)")
+            except Exception as exc:                   # noqa: BLE001
+                self._log(f"[AF] measurement failed: {exc}")
+            finally:
+                self._post(lambda: self.btn_af_diag.configure(
+                    state="normal", text="📏 Measure depth of field"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ── Legacy CNN hill climb ────────────────────────────────────────────────
+
+    def _autofocus_cnn(self, steps: list, delay: float):
+        """Coarse-to-fine hill climb on Z using the Siamese focus model.
+
+        Kept for small corrections near focus, where a pairwise preference is
+        enough.  It cannot find focus from far away: it has no notion of a range,
+        of regions, or of whether the peak was inside what it searched, which is
+        why the region-wise engine is the default.
+        """
         init_ai()
         if AI_MODEL is None:
             self._log("[AF] Focus model not loaded — autofocus skipped")
@@ -1470,8 +1726,12 @@ class MotorControlApp(tk.Tk):
 
     # ── Auto Sweep ────────────────────────────────────────────────────────────
 
-    def _save_sweep_image(self, images_dir: str, column: int, phase: str):
-        frame = self._get_frame()
+    def _save_sweep_image(self, images_dir: str, column: int, phase: str,
+                          frame=None, weight=None):
+        """Save the current frame (or a supplied stacked one) and stitch it."""
+        if frame is None:
+            frame = self._get_frame()
+            weight = self._focus_weight(frame) if frame is not None else None
         if frame is None:
             return
         try:
@@ -1482,11 +1742,30 @@ class MotorControlApp(tk.Tk):
                 self._log(f"[SWEEP] Failed to save image: {filename}")
         except Exception as e:
             self._log(f"[SWEEP] Error saving image: {e}")
-        self._stitch_submit(frame, filename)
+        self._stitch_submit(frame, filename, weight)
+
+    def _focus_weight(self, frame):
+        """Per-pixel focus confidence for the stitcher's blend (or None).
+
+        Without this the stitcher weights frames only by distance from their
+        edge, so an out-of-focus region of an otherwise acceptable frame is
+        blended at full strength wherever it lands on empty canvas - the blurred
+        band the user saw.  With it, the sharp neighbour wins the overlap.
+        """
+        if not STITCH_FOCUS_WEIGHTS or _focus_engine is None or frame is None:
+            return None
+        try:
+            cfg = self._focus_cfg()
+            w, self._focus_ref = _focus_engine.tile_weight_map(
+                frame, cfg, reference=self._focus_ref)
+            return w
+        except Exception as exc:                    # noqa: BLE001
+            self._log(f"[STITCH] focus weights unavailable: {exc}")
+            return None
 
     # ── Live mosaic ───────────────────────────────────────────────────────────
 
-    def _stitch_submit(self, frame, filename: str):
+    def _stitch_submit(self, frame, filename: str, weight=None):
         """Hand a freshly captured frame to the streaming stitcher.
 
         Non-blocking: the stitcher runs its own worker thread, so motor timing
@@ -1514,7 +1793,8 @@ class MotorControlApp(tk.Tk):
                     on_decision=self._on_stitch_decision,
                     log=lambda m: self._log(m))
             meta = {"file": filename}
-            self._stitcher.submit(frame, filename.rsplit(".", 1)[0], meta)
+            self._stitcher.submit(frame, filename.rsplit(".", 1)[0], meta,
+                                  weight=weight)
         except Exception as e:      # stitching must never break a scan
             self._log(f"[STITCH] disabled after error: {e}")
             self._stitcher = None
@@ -1597,13 +1877,38 @@ class MotorControlApp(tk.Tk):
         column_times = []
         stop = self._autosweep_stop_evt
 
-        def save(tag):
-            self._save_sweep_image(images_dir, column, tag)
+        def save(tag, frame=None, weight=None):
+            self._save_sweep_image(images_dir, column, tag, frame=frame,
+                                   weight=weight)
+
+        # Focus trend along the scan: lets each stop search a narrow window and
+        # still escalate when the prediction is wrong.  Without it every stop
+        # pays for the full travel, which would double the scan time.
+        if _focus_engine is not None:
+            self._focus_trend = _focus_engine.FocusTrend()
+        y_index = [0]
 
         def autofocus_y(tag):
-            self._autofocus(af_y_steps, af_y_delay)
+            """Focus, save what the focus produced (possibly a Z-stack)."""
+            hint = None
+            if self._focus_trend is not None:
+                pred = self._focus_trend.predict(float(column), float(y_index[0]))
+                if pred is not None:
+                    # Every scan leaves the stage *on* the focus, so what the
+                    # trend can measure per stop is how far focus moved since the
+                    # previous stop - which is exactly what a hint means here.
+                    hint = float(np.clip(pred, -6000, 6000))
+                    self._log(f"[AF] predicted shift {hint:+.0f} steps from the "
+                              f"last stop ({len(self._focus_trend)} points)")
+            self._autofocus(hint=hint, u=float(column), v=float(y_index[0]))
+            y_index[0] += 1
             time.sleep(0.5)
-            save(tag)
+            stacked = getattr(self, "_last_focus_stack", None)
+            if stacked is not None:
+                frame, weight = stacked
+                save(tag, frame, weight)
+            else:
+                save(tag)
 
         def y_sweep(direction, edge, edge_pct, detect_thr, prefix):
             """Step Y until the given boundary edge exceeds edge_pct."""
@@ -1647,9 +1952,13 @@ class MotorControlApp(tk.Tk):
             time.sleep(0.5)
             save(f"{tag}_move")
             self._log("[SWEEP] Running AutoFocus after X move")
-            self._autofocus(af_x_steps, af_x_delay)
+            self._autofocus(hint=None, u=float(column), v=float(y_index[0]))
             time.sleep(0.5)
-            save(f"{tag}_AF")
+            stacked = getattr(self, "_last_focus_stack", None)
+            if stacked is not None:
+                save(f"{tag}_AF", stacked[0], stacked[1])
+            else:
+                save(f"{tag}_AF")
             pct = self._boundary_pct()
             if pct is not None:
                 self._log(f"[SWEEP] Right boundary: {pct['right']:.1f}%")

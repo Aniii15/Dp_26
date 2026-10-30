@@ -191,6 +191,15 @@ mid-sweep still writes the mosaic. Expected log:
 [LIVE] DROP col01_Ydown_9_154458.jpg  duplicate(...)  ncc=1.00 ov=1.00 sharp=1.02  174ms
 ```
 
+### Focus weighting (why a blurred band no longer ends up in the mosaic)
+`submit(..., weight=w)` takes an optional per-pixel confidence map in frame
+coordinates. It multiplies the feathered edge weight, so in an overlap the sharp
+frame wins the pixel instead of the first frame to arrive keeping it. The maps
+come from `main_code/focus_engine.py` (`tile_weight_map` for one frame,
+`compose_focus_stack` for a fused Z-bracket); see `main_code/AUTOFOCUS.md` for
+why that is necessary on a curved blade and what it changed (blurred regions of
+the finished mosaic: 42 % → 0 % on a synthetic 2.4 mm curved surface).
+
 ### Live preview (what the GUI shows)
 ```python
 rgb, summary = st.preview(max_width=520)   # safe to call from any thread

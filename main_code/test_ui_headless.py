@@ -332,8 +332,11 @@ def main() -> int:
             fn()
             print(f"PASS {name}")
         except Exception as exc:                       # noqa: BLE001
-            failures.append(f"{name}: {type(exc).__name__}: {exc}")
-            print(f"FAIL {name}: {type(exc).__name__}: {exc}")
+            import traceback
+            tb = traceback.extract_tb(sys.exc_info()[2])[-1]
+            where = f" (line {tb.lineno}: {tb.line})" if tb else ""
+            failures.append(f"{name}: {type(exc).__name__}: {exc}{where}")
+            print(f"FAIL {name}: {type(exc).__name__}: {exc}{where}")
 
     # 1. the whole window builds -------------------------------------------
     app = None
@@ -495,6 +498,77 @@ def main() -> int:
         # Tk's after() must never be called from a worker thread
         assert "after(0," not in src, "cross-thread self.after(0, ...) found"
     check("no cross-thread after() left in main3.py", no_cross_thread_after)
+
+    # 11. the GUI's own autofocus path, driven by a fake motor + camera ------
+    def gui_autofocus():
+        if main3._focus_engine is None:
+            print("SKIP GUI autofocus (focus_engine missing)")
+            return
+        import focus_tests as ft
+
+        rig = ft.Rig(focus_z=900.0, tilt=600.0)
+        main3.Z_STEPS_PER_MM = 1600
+        app._get_frame = rig.capture           # camera
+        moves = []
+
+        def fake_move_z(steps, direction, log_fn=None):
+            # move_z(delta, direction): unsigned count + direction flag
+            d = int(steps) * (1 if direction else -1)
+            assert int(steps) > 0, f"move_z got a signed step count: {steps}"
+            moves.append(d)
+            rig.move(d)
+            return True, "ok"
+
+        main3.move_z = fake_move_z
+        app._wait_motion_stop = lambda timeout_s=10.0: True
+        app._af_mode_var.set("Region-wise (recommended)")
+        app.af_range_var.set("4000")
+        app.af_ext_var.set("2")
+        app.af_limit_var.set("16000")
+        app.af_y_c_var.set("200")
+        app.af_y_f_var.set("50")
+        app.af_y_d_var.set("0")
+        app.af_backlash_var.set("0")
+
+        res = app._autofocus()
+        app._poll_ui_queue()          # the real app drains this 20x/second
+        assert res is not None, "region engine returned nothing"
+        assert abs(res.z_peak - 900) <= 120, res.z_peak
+        assert res.bracketed, res.curve_variation
+        assert app._af_result_var.get() != "not focused yet"
+        assert app._af_detail_var.get().startswith("•")
+        assert len(moves) > 10, len(moves)
+
+        # a bare button press has no scan position, so the trend exists but is
+        # empty; points arrive from sweep stops, which know their (column, row)
+        assert app._focus_trend is not None and len(app._focus_trend) == 0
+        # second stop, further down the column: the trend predicts a shift and
+        # the engine searches a narrow window around it
+        rig2 = ft.Rig(focus_z=700.0, tilt=600.0)
+
+        def move_z2(steps, direction, log_fn=None):
+            d = int(steps) * (1 if direction else -1)
+            rig2.move(d)
+            return True, "ok"
+
+        main3.move_z = move_z2
+        app._get_frame = rig2.capture
+        for v, u in ((0.0, 900.0), (1.0, 800.0), (2.0, 700.0)):
+            app._focus_trend.add(1.0, v, u)
+        shift = app._focus_trend.predict(1.0, 3.0)
+        assert shift is not None, "trend did not predict"
+        hinted = app._autofocus(hint=shift, u=1.0, v=3.0)
+        app._poll_ui_queue()
+        assert hinted is not None, "hinted scan returned nothing"
+        assert abs(hinted.z_peak - 700) <= 150, hinted.z_peak
+        assert hinted.bracketed, (hinted.z_peak, hinted.curve_variation)
+        assert len(app._focus_trend) == 4, len(app._focus_trend)
+
+        # and the weights handed to the stitcher are a real 0..1 map
+        w = app._focus_weight(rig.capture())
+        assert w is not None and w.shape == (ft.H, ft.W), None if w is None else w.shape
+        assert 0.0 <= float(w.min()) and float(w.max()) <= 1.0
+    check("GUI autofocus path (region engine, hint, weights)", gui_autofocus)
 
     print()
     if failures:

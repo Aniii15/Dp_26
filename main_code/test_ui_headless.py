@@ -523,7 +523,7 @@ def main() -> int:
         app._wait_motion_stop = lambda timeout_s=10.0: True
         app._af_mode_var.set("Region-wise (recommended)")
         app.af_range_var.set("4000")
-        app.af_ext_var.set("2")
+        app.af_pred_var.set("600")
         app.af_limit_var.set("16000")
         app.af_y_c_var.set("200")
         app.af_y_f_var.set("50")
@@ -563,6 +563,12 @@ def main() -> int:
         assert abs(hinted.z_peak - 700) <= 150, hinted.z_peak
         assert hinted.bracketed, (hinted.z_peak, hinted.curve_variation)
         assert len(app._focus_trend) == 4, len(app._focus_trend)
+
+        # the result panel reports the Z footprint, so "it searches more range
+        # than needed" is measurable instead of a guess
+        detail = app._af_detail_var.get()
+        assert "searched" in detail and "travelled" in detail, detail
+        assert "cap" in detail, detail
 
         # and the weights handed to the stitcher are a real 0..1 map
         w = app._focus_weight(rig.capture())

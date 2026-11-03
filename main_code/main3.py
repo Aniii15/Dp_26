@@ -79,18 +79,26 @@ UPPER_BOUNDARY_THRESHOLD = 50  # stricter threshold for upper-boundary checks
 # corrections near focus.
 FOCUS_MODE = "region"
 FOCUS_CONFIG = {
-    "range_steps": 6000,      # 3.75 mm of travel per search window
-    "coarse_steps": 200,      # 0.125 mm
-    "fine_steps": 50,         # 31 um
-    "max_extensions": 2,      # window may grow twice when the peak is at an edge
+    # Hard cap on the Z search, either side of where the scan starts (0 = as far
+    # as z_travel_limit).  This is a bound, not a distance: a scan stops as soon
+    # as the peak is bracketed, and a prediction narrows it further.  Set it to
+    # the blade's real depth envelope + margin once you know it - every capture
+    # outside that envelope is pure cost.
+    "range_steps": 6000,
+    "coarse_steps": 200,      # 0.125 mm - resolution of the bracketing walk
+    "fine_steps": 50,         # 31 um - refinement pass around the peak
     "z_travel_limit": 24000,  # 15 mm either way: refuse to drive further
-    "settle_s": 0.25,
+    "settle_s": 0.20,         # wait after each Z move before grabbing a frame
     "backlash_steps": 0,      # set to ~2x the measured backlash if Z is sloppy
     "in_focus_ratio": 0.90,   # tile counts as focused at 90 % of its own best
+    "max_samples": 60,        # hard cap on captures per focus scan
+    "predictive_window": 600, # window confirmed around a predicted focus
 }
 # Bracket + fuse a Z-stack whenever a single Z cannot make the whole frame sharp.
 FOCUS_STACKING = True
-FOCUS_STACK_SAMPLES = 5
+# 3 exposures (peak, +-span/2) fuse as well as 5 and cost 2 extra captures
+# instead of 4; raise it if the blade curves so steeply that 3 leaves soft tiles.
+FOCUS_STACK_SAMPLES = 3
 # Feed a per-pixel focus weight to the stitcher, so a blurred region loses the
 # blend to a sharp neighbour instead of being baked into the mosaic.
 STITCH_FOCUS_WEIGHTS = True
@@ -1255,13 +1263,14 @@ class MotorControlApp(tk.Tk):
         rw = tk.Frame(af, bg=C["panel"])
         rw.pack(fill="x", pady=2)
         self.af_range_var = tk.StringVar(value=str(FOCUS_CONFIG["range_steps"]))
-        self.af_ext_var = tk.StringVar(value=str(FOCUS_CONFIG["max_extensions"]))
+        self.af_pred_var = tk.StringVar(
+            value=str(FOCUS_CONFIG.get("predictive_window", 600)))
         self.af_limit_var = tk.StringVar(value=str(FOCUS_CONFIG["z_travel_limit"]))
         self.af_backlash_var = tk.StringVar(
             value=str(FOCUS_CONFIG.get("backlash_steps", 0)))
         for label, var, width, suffix in (
-                ("Range:", self.af_range_var, 6, "steps"),
-                ("Extensions:", self.af_ext_var, 3, ""),
+                ("Range cap:", self.af_range_var, 6, "steps"),
+                ("Predict window:", self.af_pred_var, 5, "steps"),
                 ("Travel limit:", self.af_limit_var, 6, "steps"),
                 ("Backlash:", self.af_backlash_var, 4, "steps")):
             tk.Label(rw, text=f" {label}", bg=C["panel"], fg=C["muted"],
@@ -1285,8 +1294,25 @@ class MotorControlApp(tk.Tk):
                            (self.af_x_c_var, self.af_x_m_var,
                             self.af_x_f_var, self.af_x_d_var))
         tk.Label(af, text="C = coarse step, M = medium, F = fine step, "
-                          "D = settle delay (s)",
+                          "D = settle delay (s).  Range cap 0 = whole travel; "
+                          "set it to the blade's depth envelope to stop the "
+                          "search wandering outside it.",
                  bg=C["panel"], fg=C["muted"], font=FONT_SMALL).pack(anchor="w")
+
+        preset_row = tk.Frame(af, bg=C["panel"])
+        preset_row.pack(fill="x", pady=(6, 0))
+        tk.Label(preset_row, text="Preset:", bg=C["panel"], fg=C["text"],
+                 font=FONT_SMALL).pack(side="left", padx=(0, 6))
+        for name, flag in (("Fast (sweeps)", "fast"),
+                           ("Balanced", "balanced"),
+                           ("Accurate (single shot)", "accurate")):
+            self._make_btn(preset_row, name,
+                           lambda f=flag: self._apply_focus_preset(f)).pack(
+                side="left", padx=2)
+        self._af_preset_var = tk.StringVar(
+            value="these values are also saved in FOCUS_CONFIG")
+        tk.Label(af, textvariable=self._af_preset_var, bg=C["panel"],
+                 fg=C["muted"], font=FONT_SMALL).pack(anchor="w", pady=(4, 0))
 
         btn_row = tk.Frame(af, bg=C["panel"])
         btn_row.pack(fill="x", pady=(8, 0))
@@ -1527,7 +1553,8 @@ class MotorControlApp(tk.Tk):
         base["range_steps"] = int(num(self.af_range_var, base["range_steps"]))
         base["coarse_steps"] = int(num(self.af_y_c_var, base["coarse_steps"]))
         base["fine_steps"] = int(num(self.af_y_f_var, base["fine_steps"]))
-        base["max_extensions"] = int(num(self.af_ext_var, base["max_extensions"]))
+        base["predictive_window"] = int(num(self.af_pred_var,
+                                           base["predictive_window"]))
         base["z_travel_limit"] = int(num(self.af_limit_var, base["z_travel_limit"]))
         base["settle_s"] = num(self.af_y_d_var, base["settle_s"])
         base["backlash_steps"] = int(num(self.af_backlash_var, 0))
@@ -1612,8 +1639,18 @@ class MotorControlApp(tk.Tk):
         if not hasattr(self, "_af_result_var"):
             return
         self._af_result_var.set(result.summary(Z_STEPS_PER_MM))
-        self._af_detail_var.set("\n".join(
-            f"• {line}" for line in result.recommendation(Z_STEPS_PER_MM)))
+        lines = [f"• {line}" for line in result.recommendation(Z_STEPS_PER_MM)]
+        runner = getattr(self, "_last_focus_runner", None)
+        if runner is not None and getattr(runner, "stack", None) is not None:
+            zs = getattr(runner.stack, "z", [])
+            if zs:
+                span = (max(zs) - min(zs)) / Z_STEPS_PER_MM
+                lines.append(
+                    f"• searched ±{span / 2:.2f} mm in Z, stage travelled "
+                    f"{runner.travel_steps / Z_STEPS_PER_MM:.2f} mm over "
+                    f"{result.samples} captures "
+                    f"(cap ±{self._focus_cfg().range_steps / 2 / Z_STEPS_PER_MM:.2f} mm)")
+        self._af_detail_var.set("\n".join(lines))
         colour = C["success"] if (result.bracketed
                                   and result.in_focus_area >= 0.6) else C["warn"]
         if not result.bracketed:
@@ -1624,6 +1661,34 @@ class MotorControlApp(tk.Tk):
         if hasattr(self, "_af_result_var"):
             self._af_result_var.set(text)
             self._af_result_label.configure(fg=C[colour])
+
+    # Presets: the two things that decide how long a scan takes are how far it
+    # walks (range/coarse/fine) and how long it waits at each stop (D).  A sweep
+    # wants speed on hundreds of stops; a single-shot focus before a capture
+    # wants accuracy and can afford a finer walk.
+    _FOCUS_PRESETS = {
+        "fast": {"range": "3000", "coarse": "300", "fine": "100", "settle": "0.12",
+                 "note": "Fast: ±0.94 mm cap, 0.19 mm walk, 0.12 s settle"},
+        "balanced": {"range": "6000", "coarse": "200", "fine": "50", "settle": "0.20",
+                     "note": "Balanced: ±1.9 mm cap, 0.125 mm walk, 0.20 s settle"},
+        "accurate": {"range": "0", "coarse": "120", "fine": "40", "settle": "0.30",
+                     "note": "Accurate: whole travel, 75 um walk, 0.30 s settle"},
+    }
+
+    def _apply_focus_preset(self, name: str):
+        """One click for the range/coarse/fine/settle combination."""
+        p = self._FOCUS_PRESETS.get(name)
+        if p is None:
+            return
+        self.af_range_var.set(p["range"])
+        for c_var in (self.af_y_c_var, self.af_x_c_var):
+            c_var.set(p["coarse"])
+        for f_var in (self.af_y_f_var, self.af_x_f_var):
+            f_var.set(p["fine"])
+        for d_var in (self.af_y_d_var, self.af_x_d_var):
+            d_var.set(p["settle"])
+        self._af_preset_var.set(p["note"])
+        self._log(f"[AF] preset '{name}': {p['note']}")
 
     def _diagnose_focus(self):
         """Scan Z and report the blade's depth profile — no scanning of the blade."""
@@ -1893,6 +1958,10 @@ class MotorControlApp(tk.Tk):
             hint = None
             if self._focus_trend is not None:
                 pred = self._focus_trend.predict(float(column), float(y_index[0]))
+                if pred is None and self._focus_result is not None:
+                    # too few points to fit a trend: the previous stop's answer is
+                    # still a far better guess than "search the whole travel"
+                    pred = 0.0
                 if pred is not None:
                     # Every scan leaves the stage *on* the focus, so what the
                     # trend can measure per stop is how far focus moved since the
@@ -1952,7 +2021,11 @@ class MotorControlApp(tk.Tk):
             time.sleep(0.5)
             save(f"{tag}_move")
             self._log("[SWEEP] Running AutoFocus after X move")
-            self._autofocus(hint=None, u=float(column), v=float(y_index[0]))
+            # An X advance is 0.4 mm of sideways travel; the surface depth
+            # changes by far less than one coarse step, so the focus shift is 0.
+            # Passing no hint here made every column turn pay for a full search of
+            # the whole Z travel - the single biggest cost in a sweep.
+            self._autofocus(hint=0.0, u=float(column), v=float(y_index[0]))
             time.sleep(0.5)
             stacked = getattr(self, "_last_focus_stack", None)
             if stacked is not None:

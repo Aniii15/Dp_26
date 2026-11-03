@@ -36,6 +36,8 @@ import cv2
 import numpy as np
 
 from .config import LiveConfig
+from .frames import analyse_frame
+from .prior import StagePrior
 from .mosaic import AddResult, IncrementalMosaic
 from .quality import QualityReport, assess_intrinsic, focus_ratio
 from .registration import Registrar, Registration
@@ -50,6 +52,7 @@ class Node:
     pose: np.ndarray          # 3x3, full-res frame px -> mosaic px
     shape: tuple[int, int]    # (h, w) of the full-resolution frame
     blended: bool = True      # False for duplicates that only serve as anchors
+    axis: str = ""            # commanded axis that produced this frame ("Y"/"X")
 
 
 @dataclass
@@ -66,6 +69,7 @@ class Decision:
     sharp_ratio: float = 1.0
     gain: float = 1.0
     inliers: int = 0
+    dead_frac: float = 0.0        # fraction of the frame that is not image
     method: str = ""
     ms: float = 0.0
     pose: np.ndarray | None = None
@@ -136,6 +140,10 @@ class LiveStitcher:
         self._pending = 0
         self._canvas_warned = False
         self._last_abs_sharpness = 0.0
+        self.prior = StagePrior(
+            min_samples=int(getattr(cfg, "axis_min_samples", 3)),
+            strict=bool(getattr(cfg, "axis_prior_strict", True)),
+            rel_tol=float(getattr(cfg, "axis_prior_rel_tol", 0.35)))
         self._kept_dir = Path(save_kept_dir) if save_kept_dir else None
         self._rej_dir = Path(save_rejected_dir) if save_rejected_dir else None
         Path(self.prefix).parent.mkdir(parents=True, exist_ok=True)
@@ -147,7 +155,8 @@ class LiveStitcher:
     # ── public API ──────────────────────────────────────────────────────────
     def submit(self, frame: np.ndarray, tag: str | None = None,
                meta: dict | None = None,
-               weight: np.ndarray | None = None) -> bool:
+               weight: np.ndarray | None = None,
+               axis: str | None = None) -> bool:
         """Queue a captured frame.  Returns False if backpressure dropped it."""
         self._counter += 1
         tag = tag or f"frame_{self._counter:04d}"
@@ -158,8 +167,8 @@ class LiveStitcher:
             self._pending += 1
         try:
             w = None if weight is None else np.asarray(weight, np.float32)
-            self._queue.put((self._counter, tag, frame.copy(), meta or {}, w),
-                            timeout=2.0)
+            self._queue.put((self._counter, tag, frame.copy(), meta or {}, w,
+                             axis), timeout=2.0)
             return True
         except queue.Full:
             with self._lock:
@@ -170,7 +179,8 @@ class LiveStitcher:
 
     def process(self, frame: np.ndarray, tag: str, meta: dict | None = None,
                 index: int | None = None, record: bool = True,
-                weight: np.ndarray | None = None) -> Decision:
+                weight: np.ndarray | None = None,
+                axis: str | None = None) -> Decision:
         """Process one frame synchronously and account for it.
 
         Recording happens here rather than in the worker so that a caller using
@@ -178,19 +188,33 @@ class LiveStitcher:
         bookkeeping as the queue: ``summary()`` and the CSV stay consistent with
         what was actually stitched.
         """
-        d = self._process(frame, tag, meta, index, weight=weight)
+        d = self._process(frame, tag, meta, index, weight=weight, axis=axis)
         if record:
             self._record(d)
         return d
 
     def _process(self, frame: np.ndarray, tag: str, meta: dict | None = None,
                  index: int | None = None,
-                 weight: np.ndarray | None = None) -> Decision:
+                 weight: np.ndarray | None = None,
+                 axis: str | None = None) -> Decision:
         """The actual decision logic for one frame."""
         t0 = time.perf_counter()
         cfg = self.cfg
         d = Decision(tag=tag, index=self._counter if index is None else index)
         d.extra["frame"] = frame
+
+        # ── 0. what part of this frame is actually image? ───────────────────
+        # A dead border or clipped corner is near-black.  Treated as image it
+        # becomes a pale block once the exposure gain lifts it, which is exactly
+        # the "patched up" look; so it is measured first and excluded everywhere.
+        geo = analyse_frame(frame, dead_luma=cfg.dead_luma,
+                            max_dead_frac=cfg.max_dead_frac)
+        d.dead_frac = geo.dead_frac
+        d.extra["valid"] = geo.valid
+        if geo.dead_frac > cfg.max_dead_frac:
+            d.reason = f"clipped_frame({geo.dead_frac:.0%})"
+            d.ms = (time.perf_counter() - t0) * 1000
+            return d
 
         # ── 1. cheap intrinsic gate ─────────────────────────────────────────
         rep = assess_intrinsic(frame, cfg)
@@ -219,19 +243,24 @@ class LiveStitcher:
         # ── 2. first frame becomes the origin ───────────────────────────────
         if not self.nodes:
             pose = np.eye(3)
-            res = self._safe_add(frame, pose, weight=weight)
+            res = self._safe_add(frame, pose, weight=weight,
+                                 valid=d.extra.get("valid"))
             if res is None:
                 d.reason = "canvas_full"
                 d.ms = (time.perf_counter() - t0) * 1000
                 return d
-            self._accept(d, token, pose, frame.shape[:2], res)
+            self._accept(d, token, pose, frame.shape[:2], res, axis)
             d.method = "origin"
             d.pose = pose
             d.ms = (time.perf_counter() - t0) * 1000
             return d
 
         # ── 3. register against anchors ─────────────────────────────────────
-        prior = self._predicted_step()
+        # The commanded axis tells us which *family* of motion to expect; once
+        # the stage's real signature has been learned this is a much tighter
+        # prior than "same step as last time", so a periodic hole cannot win.
+        axis_pred = self.prior.expected(axis)
+        prior = axis_pred if axis_pred is not None else self._predicted_step()
         results: list[tuple[Node, Registration]] = []
         for node in self._anchor_candidates(prior):
             scale = self.registrar.scale(node.token)
@@ -271,13 +300,14 @@ class LiveStitcher:
                 d.ms = (time.perf_counter() - t0) * 1000
                 return d
             try:
-                res, pose = self.mosaic.add_disconnected(frame)
+                res, pose = self.mosaic.add_disconnected(
+                    frame, valid=d.extra.get("valid"))
             except MemoryError as exc:
                 self._canvas_full(exc)
                 d.reason = "canvas_full"
                 d.ms = (time.perf_counter() - t0) * 1000
                 return d
-            self._accept(d, token, pose, frame.shape[:2], res)
+            self._accept(d, token, pose, frame.shape[:2], res, axis)
             d.reason = "unregistered-parked"
             d.method = "parked"
             d.ms = (time.perf_counter() - t0) * 1000
@@ -287,6 +317,17 @@ class LiveStitcher:
         d.ncc, d.overlap, d.inliers, d.method = (
             best.ncc, best.overlap, best.inliers, best.method)
         d.dx, d.dy = (float(v) for v in best.shift)
+
+        # ── 3b. does the measured motion agree with the commanded axis? ─────
+        ok, why = self.prior.check(axis, best.shift)
+        if not ok:
+            d.reason = f"implausible_motion({why})"
+            d.method = best.method + "+axis-veto"
+            d.ms = (time.perf_counter() - t0) * 1000
+            return d
+
+        # the motion passed the veto: this is what the commanded axis really does
+        self.prior.observe(axis, (d.dx, d.dy))
 
         # ── 4. fuse the poses implied by every successful anchor ────────────
         pose = self._fuse_poses(results)
@@ -300,7 +341,7 @@ class LiveStitcher:
                 # chain: otherwise the next frame is matched across two motor
                 # steps, the overlap halves, matching collapses and the scan
                 # cascades into "disconnected" bands (observed: 104 bands).
-                self._anchor(d, token, pose, frame.shape[:2])
+                self._anchor(d, token, pose, frame.shape[:2], axis)
             d.ms = (time.perf_counter() - t0) * 1000
             return d
 
@@ -320,10 +361,11 @@ class LiveStitcher:
             d.new_area = new_area
             if new_area < cfg.fill_min_new_area:
                 return reject(f"soft_and_redundant({sharp:.2f})")
-            res = self._safe_add(frame, pose, empty_only=True, low_quality=True)
+            res = self._safe_add(frame, pose, empty_only=True, low_quality=True,
+                                 valid=d.extra.get("valid"))
             if res is None:
                 return reject("canvas_full")
-            self._accept(d, token, pose, frame.shape[:2], res)
+            self._accept(d, token, pose, frame.shape[:2], res, axis)
             d.status = "filled"
             d.reason = f"soft_fill({sharp:.2f})"
             d.ms = (time.perf_counter() - t0) * 1000
@@ -336,10 +378,11 @@ class LiveStitcher:
             return reject(f"duplicate(new_area={new_area:.2f})")
 
         # ── 6. accept and blend ─────────────────────────────────────────────
-        res = self._safe_add(frame, pose, weight=weight)
+        res = self._safe_add(frame, pose, weight=weight,
+                             valid=d.extra.get("valid"))
         if res is None:
             return reject("canvas_full")
-        self._accept(d, token, pose, frame.shape[:2], res)
+        self._accept(d, token, pose, frame.shape[:2], res, axis)
         d.ms = (time.perf_counter() - t0) * 1000
         self._maybe_flush()
         return d
@@ -431,6 +474,8 @@ class LiveStitcher:
             "disconnected": self.mosaic.disconnected,
             "mean_ncc": float(np.mean([d.ncc for d in acc])) if acc else 0.0,
             "mean_ms": float(np.mean([d.ms for d in self.decisions])) if self.decisions else 0.0,
+            "axes": self.prior.summary(),
+            "axis_vetoes": self.prior.rejections,
             "canvas": self.mosaic.bbox(),
             "columns": self._column_stats(),
         }
@@ -463,13 +508,13 @@ class LiveStitcher:
         def run():
             while not self._stop.is_set() or not self._queue.empty():
                 try:
-                    idx, tag, frame, meta, wt = self._queue.get(timeout=0.2)
+                    idx, tag, frame, meta, wt, ax = self._queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
                 with self._lock:
                     try:
                         d = self.process(frame, tag, meta, index=idx,
-                                         weight=wt)
+                                         weight=wt, axis=ax)
                     except Exception as exc:
                         # One bad frame (or one exhausted canvas limit) must
                         # never kill the pipeline mid-scan.
@@ -511,14 +556,16 @@ class LiveStitcher:
                         [cv2.IMWRITE_JPEG_QUALITY, 90])
 
     def _accept(self, d: Decision, token: str, pose: np.ndarray,
-                shape: tuple[int, int], res: AddResult) -> None:
+                shape: tuple[int, int], res: AddResult,
+                axis: str | None = None) -> None:
         d.status = "accepted"
         d.new_area = res.new_area
         d.gain = res.gain
         d.pose = pose
         if d.quality is not None:
             self._last_abs_sharpness = max(d.quality.sharpness, 1e-9)
-        self.nodes.append(Node(tag=d.tag, token=token, pose=pose, shape=shape))
+        self.nodes.append(Node(tag=d.tag, token=token, pose=pose, shape=shape,
+                               axis=axis or ""))
         self._pending_step = None
         self._trim_cache()
 
@@ -546,11 +593,11 @@ class LiveStitcher:
             return None
 
     def _anchor(self, d: Decision, token: str, pose: np.ndarray,
-                shape: tuple[int, int]) -> None:
+                shape: tuple[int, int], axis: str | None = None) -> None:
         """Register a frame as a pose anchor without blending it."""
         d.pose = pose
         self.nodes.append(Node(tag=d.tag, token=token, pose=pose, shape=shape,
-                               blended=False))
+                               blended=False, axis=axis or ""))
         self._pending_step = pose[:2, 2] - self.nodes[-2].pose[:2, 2] \
             if len(self.nodes) > 1 else None
         self._trim_cache()

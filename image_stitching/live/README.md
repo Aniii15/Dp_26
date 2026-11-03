@@ -275,13 +275,74 @@ catchable exception, is what fails first on a 4–8 GB machine. Run
 * **Column linking assumes overlap.** With the current 0.4 mm step that is not
   guaranteed; the pipeline then honestly reports separate bands instead of
   inventing a link.
-* **No radiometric model.** Per-frame gain is a single clipped scalar; for
-  quantitative defect measurement, flat-field correction would be better than
-  seam blending.
+* **The radiometric model is a flat field plus a scalar, not a global solve.**
+  Each frame's own smooth illumination profile is divided out and the remaining
+  exposure level is matched by one clipped scalar (see §7). That is enough to
+  make seams invisible, but it does not recover absolute reflectance: a genuine
+  large-scale albedo change (a shadow cast across the part) is partly normalised
+  away. For quantitative defect radiometry, calibrate against a reference target
+  instead of inferring the field from the surface itself.
 * **`--settle` gating is time-based.** A proper trigger would evaluate
   `sharpness` and frame-diff inside a short window; `MotionDetector` in
   `main3.py` already has the frame-diff half of that.
-* **Tests** (`live/tests/test_live.py`, 11 cases) cover shift recovery, quality
+* **Tests** (`live/tests/test_live.py`, 27 cases) cover shift recovery, quality
   gates, duplicate rejection, hole-filling, resilience to a bad frame, async
   finalisation and one real-data registration test. Run:
   `python live/tests/test_live.py`.
+
+---
+
+## 7. Why the delivered mosaics looked "patched up" — and what changed
+
+Four separate faults, in the order they matter. Each one is now measured by
+`live/tests/repro_patchy_mosaic.py`, which stitches a synthetic serpentine scan
+twice (old behaviour / new) against a ground-truth stitch of the same part:
+
+| | before | after |
+|---|---|---|
+| error vs a clean stitch (mean / worst 1 %) | 40.1 / 123.3 luma | **3.3 / 4.3 luma** |
+| brightness step across a frame boundary | 0.9 luma | **0.5 luma** |
+| mosaic area that is a pale block | 2.6 % | **0.0 %** |
+
+(The seam figure is already at the noise floor of the metric; what is left is
+grain, not a band.)
+
+**1. Dead pixels were treated as image.** A clipped sensor border / corner reads
+near-black. Every frame was multiplied by a single exposure gain clipped at 2×,
+so that near-black strip was *brightened* to mid-grey and blended at full
+strength: a flat pale rectangle, once per frame, offset along the scan — exactly
+the "patched up" look. `frames.analyse_frame()` now builds a validity mask
+(luma ≤ `dead_luma`, largest connected component, holes filled, eroded), blends
+nothing outside it, and excludes it from every statistic. A frame that is mostly
+dead is rejected as `clipped_frame` instead of being stitched.
+
+**2. A scalar gain cannot cancel a gradient.** Light falls off across the field
+of view, so the same point of the part is brighter in the middle of a frame than
+at its edge. One scalar matches the *mean* and leaves the slope, which the
+feather then spreads into a visible band at every seam. And it cannot be fixed
+by matching frames to each other: the surface is common to all frames, so the
+overlap only ever determines it over a strip, and extrapolating that strip over
+the rest of the frame is what produces brightness *rectangles*. It is now
+measured per frame and divided out (`frames.flatten_illumination`, a robust
+4th-order surface fit on block medians, ~90 ms on an 8 Mpx frame, in the worker
+thread). Afterwards the only difference between frames is the exposure level,
+which one scalar cancels exactly.
+
+**3. The blend weight had a kink.** `min(distanceTransform, feather_px)` is C0:
+its gradient jumps where it saturates, which draws a line along the seam when
+the overlap is narrow. `frames.smooth_weight()` is smoothstep^`feather_gamma`,
+C1 inside the valid area and zero outside it.
+
+**4. Registration had no idea what the rig can do.** Consecutive frames are
+neighbours, but on an imperfectly square rig "neighbour" is not "one pixel
+column up". `prior.StagePrior` learns each commanded axis's real displacement
+(mean, spread, rotation) from the frames it has already verified, then uses it
+as a narrower registration prior and **vetoes** a match that contradicts it —
+before the frame is blended. A stair-stepped, skewed or drifting step is learned
+rather than assumed; it stays permissive until it has `axis_min_samples`
+observations, so it cannot reject a scan it has not seen. `main3.py` passes the
+axis it commanded (`Ydown`, `Xr2`, ...) with each frame, so this works without
+guessing from the image.
+
+Related knob: `exposure_gain_clip` (a scalar) is still there, but it is no
+longer asked to do a job it cannot do.

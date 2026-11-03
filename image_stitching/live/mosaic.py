@@ -24,6 +24,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from .frames import flatten_illumination, smooth_weight, warp_valid
+
 GROW_MARGIN = 256
 
 
@@ -158,10 +160,18 @@ class IncrementalMosaic:
         return np.clip(out, 1e-3, 1.0) * mask
 
     def _weight(self, mask: np.ndarray) -> np.ndarray:
-        dist = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 3)
-        return (np.minimum(dist, float(self.cfg.feather_px)) * mask).astype(np.float32)
+        """Blend weight: C1 ramp inside the valid area, zero outside.
 
-    def _exposure_gain(self, warped: np.ndarray, mask: np.ndarray, roi) -> float:
+        The ramp is measured from the *valid* boundary, so a clipped corner is at
+        zero weight and fades in over ``feather_px`` instead of being stamped on
+        the canvas at full strength.
+        """
+        w = smooth_weight(mask, float(self.cfg.feather_px),
+                          float(getattr(self.cfg, "feather_gamma", 2.0)))
+        return w.astype(np.float32)
+
+    def _exposure_gain(self, warped: np.ndarray, mask: np.ndarray, roi,
+                       known: np.ndarray | None = None) -> float:
         """Robust luma ratio against the already-blended canvas (subsampled).
 
         The median is computed on a 1/16 pixel subset: full-resolution medians
@@ -169,8 +179,7 @@ class IncrementalMosaic:
         """
         sub = 4
         ws = self._wsum[roi][::sub, ::sub]
-        known = ws > 0
-        overlap = mask[::sub, ::sub] & known
+        overlap = mask[::sub, ::sub] & (ws > 0)
         if overlap.sum() < 200:
             return 1.0
         old_y = self._acc[roi][::sub, ::sub].mean(axis=2) / np.maximum(ws, 1e-3)
@@ -193,10 +202,16 @@ class IncrementalMosaic:
 
     def add(self, frame: np.ndarray, to_mosaic: np.ndarray,
             empty_only: bool = False, low_quality: bool = False,
-            weight: np.ndarray | None = None) -> AddResult:
+            weight: np.ndarray | None = None,
+            valid: np.ndarray | None = None) -> AddResult:
         """Blend a frame.  ``empty_only`` fills canvas holes without touching
         already-covered pixels (used for soft frames), and ``low_quality``
         records those pixels in the QC mask.
+
+        ``valid`` is the frame's validity mask (``frames.analyse_frame``): dead
+        camera border, clipped corners.  Those pixels are never blended and are
+        excluded from the exposure fit - treating them as image is what produced
+        the pale rectangles in the delivered mosaics.
 
         ``weight`` is an optional per-pixel confidence in frame coordinates
         (``HxW``, 0..1), typically from ``focus_engine.tile_weight_map`` or the
@@ -206,15 +221,31 @@ class IncrementalMosaic:
         mosaic - the defect that made a band of the delivered image unusable.
         """
         frame, to_mosaic = self._scaled(frame, to_mosaic)
+        if getattr(self.cfg, "flatten_illumination", True):
+            # the frame's own smooth brightness surface (light falloff across the
+            # field of view, dimmer corners) is common to every frame, so matching
+            # cannot remove it - it has to be measured and divided out, otherwise
+            # every seam carries a step that the eye reads as a rectangle
+            frame = flatten_illumination(
+                frame, valid,
+                clip=float(getattr(self.cfg, "flatten_clip", 1.6)),
+                order=int(getattr(self.cfg, "flatten_order", 4)))
         roi, size, m = self._roi(frame.shape, to_mosaic)
         warped, mask = self._warp(frame, m, size)
+        # dead border / clipped corners are not image: drop them before anything
+        # measures or blends this frame
+        if valid is not None:
+            mask &= warp_valid(valid, m, size, valid_px=1) > 0
+            if not mask.any():
+                self._placed += 1
+                return AddResult(0.0, 1.0, self._wsum.shape)
         w_frame = None
         if weight is not None:
             w_frame = self._warp_weight(weight, frame.shape[:2], m, size, mask)
         known = self._wsum[roi] > 0
         total = float(mask.sum())
         new_area = float((mask & ~known).sum()) / total if total else 0.0
-        gain = self._exposure_gain(warped, mask, roi)
+        gain = self._exposure_gain(warped, mask, roi, known)
         if empty_only:
             mask = mask & ~known
             if not mask.any():
@@ -223,6 +254,8 @@ class IncrementalMosaic:
         if w_frame is not None:
             w = w * w_frame
         if gain != 1.0:
+            # with the illumination flattened, the only remaining difference is
+            # the exposure level, which one scalar cancels exactly
             warped = np.clip(warped.astype(np.float32) * gain, 0, 255).astype(np.uint8)
         # Blend only inside the frame's ROI, keeping temporaries frame-sized.
         acc_roi = self._acc[roi]
@@ -248,14 +281,16 @@ class IncrementalMosaic:
             return 0.0
         return float((mask & (self._wsum[roi] <= 0)).sum()) / total
 
-    def add_disconnected(self, frame: np.ndarray) -> tuple[AddResult, np.ndarray]:
+    def add_disconnected(self, frame: np.ndarray,
+                         valid: np.ndarray | None = None
+                         ) -> tuple[AddResult, np.ndarray]:
         """Place a frame that could not be registered, to the right with a gap."""
         box = self.bbox()
         x = float(box[2] + 64) if box else 0.0
         y = float(box[1]) if box else 0.0
         to_mosaic = np.array([[1, 0, x], [0, 1, y], [0, 0, 1]], float)
         self._disconnected += 1
-        return self.add(frame, to_mosaic), to_mosaic
+        return self.add(frame, to_mosaic, valid=valid), to_mosaic
 
     # ── output ──────────────────────────────────────────────────────────────
     def render(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

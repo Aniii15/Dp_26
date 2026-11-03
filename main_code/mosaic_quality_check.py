@@ -137,7 +137,7 @@ def af_narrow(stage: Stage) -> float:
 
 def af_wide(stage: Stage) -> tuple[fe.FocusResult, fe.AutoFocus]:
     cfg = fe.FocusConfig(settle_s=0, range_steps=6000, coarse_steps=200,
-                         max_extensions=2, tiles_x=6, tiles_y=3)
+                         tiles_x=6, tiles_y=3)
     af = fe.AutoFocus(stage.move, stage.capture, cfg, log=lambda m: None,
                       sleep=lambda s: None, origin=stage.z)
     return af.run(), af

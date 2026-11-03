@@ -33,9 +33,9 @@ What this module does instead
   comparable - "0.95" means "95 % of the best this patch can ever look".
 * **Searches a range, then refuses to lie about it.**  The scan covers the whole
   configured travel in both directions.  If the best sample is at either end of
-  the window, the window is *extended* and rescanned (up to ``max_extensions``,
-  never past ``z_travel_limit``).  Only a bracketed peak - sharp on both sides -
-  counts as focus.  This is the direct fix for "the range was too small".
+  the window, the walk keeps going (never past ``z_travel_limit``).  Only a
+  bracketed peak - sharp on both sides - counts as focus.  This is the direct
+  fix for "the range was too small".
 * **Optimises the area in focus**, not one number: the chosen Z is the one that
   maximises the fraction of (usable) blade area that is within
   ``in_focus_ratio`` of its own peak.  When several regions cannot be sharp at
@@ -101,7 +101,6 @@ class FocusConfig:
     coarse_steps: int = 200          # 0.125 mm
     fine_steps: int = 50             # 31 um
     fine_samples: int = 5            # samples per fine sweep (odd)
-    max_extensions: int = 2          # how many times the window may grow
     z_travel_limit: int = 24000      # 15 mm either way: hard safety clamp
     max_samples: int = 140           # budget guard for one scan
     settle_s: float = 0.18           # wait after every Z move before capture
@@ -118,6 +117,14 @@ class FocusConfig:
     # produced blurred bands in the mosaic.
     blend_falloff: float = 0.01      # weight = exp(-shortfall/tau), focus stacking
     bracket_margin: float = 0.05
+    gallop_signal: float = 2.5
+    """How much the gallop's best sample must stand above its worst before the
+    neighbourhood is worth rescanning.  On a blade that is simply out of reach
+    every sample is noise and the spread is ~1.7x; a real focus cone that the
+    gallop stepped over still shows 5-10x, because the blur ramp is steep.
+    Without this test the scan would either give up on a focusable patch (it
+    stepped over the cone) or spend a hundred captures proving a blade is out of
+    range."""
     curve_min_variation: float = 0.05
     min_peak_sharpness: float = 0.01
     """Absolute floor for "this sample is actually sharp".
@@ -725,8 +732,11 @@ class AutoFocus:
         self.stack.add(z, frame)
         return float(self.stack.area_in_focus()[-1])
 
+    def _budget_left(self) -> bool:
+        return len(self.stack) < self.cfg.max_samples
+
     def _check_budget(self) -> None:
-        if len(self.stack) >= self.cfg.max_samples:
+        if not self._budget_left():
             raise FocusError(
                 f"sample budget exhausted ({self.cfg.max_samples}) - "
                 f"narrow the range or coarsen the step")
@@ -753,6 +763,162 @@ class AutoFocus:
         area = self.stack.area_in_focus()
         best = float(area.max() * 100) if area.size else -1.0
         self.log(f"[AF] scanned {lo:+.0f}..{hi:+.0f} (best so far {best:.0f}%)")
+
+    def _gallop(self, center: float, step: float, limit: float
+                ) -> tuple[tuple[float, float] | None, float, float, float]:
+        """Find *any* sharp Z cheaply, doubling the offset each round.
+
+        With no hint the focus can be anywhere in the travel, and stepping there
+        at the scan resolution costs one capture per 200 steps (a full 15 mm
+        would be 120 captures).  Doubling the offset instead reaches the whole
+        travel in ~8 captures per side, and stops the moment a sample is actually
+        sharp enough to be worth bracketing - resolution only matters once the
+        neighbourhood is known.
+
+        Returns ``(hit, best_z, best_offset, spread)``: ``hit`` is
+        ``(z, offset)`` when something was sharp enough to bracket, otherwise
+        None; the rest describes the best (possibly blurry) sample seen, which is
+        what localises a focus cone the sweep stepped over.  ``spread`` is
+        best/worst over the sweep: ~1.7 means "no signal anywhere", 5-10 means
+        "the cone is in there somewhere".
+        """
+        cfg = self.cfg
+        offset = max(1.0, float(step))
+        best_z, best_q, best_off = center, -1.0, 0.0
+        worst_q = float("inf")
+        while offset <= limit:
+            moved = False
+            for sign in (1.0, -1.0):
+                z = center + sign * offset
+                if abs(z) > limit:
+                    continue
+                if not self._budget_left():
+                    spread = best_q / worst_q if worst_q and worst_q > 0 else 1.0
+                    return None, best_z, best_off, spread
+                if self._sample(z) is None:
+                    return None, best_z, best_off, 1.0
+                moved = True
+                q = float(self.stack.quality()[-1])
+                worst_q = min(worst_q, q)
+                if q > best_q:
+                    best_z, best_q, best_off = z, q, offset
+                if q >= cfg.min_peak_sharpness:
+                    self.log(f"[AF] sharp sample found at {z:+.0f} "
+                             f"({offset:.0f} steps out) -> bracketing there")
+                    return (z, offset), best_z, best_off, 1.0
+            if not moved:
+                break
+            offset *= 2.0
+        spread = best_q / worst_q if worst_q and worst_q > 0 else 1.0
+        return None, best_z, best_off, spread
+
+    def _bracket_walk(self, center: float, step: float, max_offset: float,
+                      limit: float) -> str:
+        """Walk out from ``center`` and stop as soon as the peak is bracketed.
+
+        Each side is abandoned the moment its samples fall clearly below the best
+        score seen so far, so a well-centred start costs a handful of captures
+        instead of the whole window.  A side is only abandoned *if something was
+        sharp there*: on a featureless or hopelessly defocused field the curve is
+        noise, and closing on noise would end the search before it had covered the
+        range (and would let it claim "not reachable" without looking).
+
+        Returns ``"bracketed"``, ``"limit"``, ``"budget"`` or ``"nothing_sharp"``.
+        """
+        cfg = self.cfg
+        step = max(1.0, float(step))
+        if self._sample(center) is None and not len(self.stack):
+            return "no_frames"
+        closed = {"neg": False, "pos": False}
+        announced = False
+        hit_limit = False
+        k = 0
+        while True:
+            k += 1
+            offset = k * step
+            if offset > max_offset:
+                if self.stack.bracketed():
+                    return "bracketed"
+                return "travel" if hit_limit else "limit"
+            if offset > cfg.range_steps / 2.0 and not announced:
+                announced = True
+                self.log(f"[AF] still climbing past the configured range "
+                         f"({cfg.range_steps} steps) -> extending the search window")
+            moved = False
+            for side, sign in (("pos", 1.0), ("neg", -1.0)):
+                if closed[side]:
+                    continue
+                z = center + sign * offset
+                if abs(z) > limit:
+                    closed[side] = True
+                    hit_limit = True
+                    continue
+                if not self._budget_left():
+                    self.log(f"[AF] stopped at the {cfg.max_samples}-sample "
+                             f"budget after +-{offset:.0f} steps")
+                    return "budget"
+                self._sample(z)
+                moved = True
+                q = self.stack.quality()
+                best = float(q.max())
+                if best < cfg.min_peak_sharpness:
+                    continue            # nothing sharp yet: keep looking, don't close
+                if float(q[-1]) < best * (1.0 - cfg.bracket_margin):
+                    closed[side] = True
+            if not moved:
+                return "travel" if hit_limit else "limit"
+            if closed["pos"] and closed["neg"]:
+                if self.stack.bracketed():
+                    return "bracketed"
+                if float(self.stack.quality().max()) < cfg.min_peak_sharpness:
+                    return "nothing_sharp"
+                return "limit"
+
+    def _scan(self, center: float, hint: bool) -> str:
+        """Gallop to the right neighbourhood (when unsure), then bracket finely."""
+        cfg = self.cfg
+        if hint:
+            # A prediction comes from the trend along the scan path, so trust it
+            # enough to bracket straight away in a narrow window; anything less
+            # than a clean bracket falls through to the wide hunt below.
+            outcome = self._bracket_walk(
+                center, cfg.coarse_steps,
+                max(2.0 * cfg.coarse_steps, cfg.predictive_window / 2.0),
+                cfg.z_travel_limit)
+            if outcome == "bracketed":
+                return outcome
+            if outcome == "no_frames":
+                return outcome
+            q = self.stack.quality()
+            if q.size:
+                center = float(np.asarray(self.stack.z, float)[int(np.argmax(q))])
+            self.log(f"[AF] no bracket within +-{cfg.predictive_window / 2:.0f} "
+                     f"steps of the prediction -> widening the hunt from "
+                     f"{center:+.0f}")
+        hit, best_z, best_off, spread = self._gallop(
+            center, cfg.coarse_steps, cfg.z_travel_limit)
+        if hit is not None:
+            z_hit, offset = hit
+            # The gallop only proves "there is texture here worth resolving"; the
+            # walk must still be free to climb past it to the real peak, so its
+            # allowance is the configured range, not the gallop's last offset.
+            return self._bracket_walk(z_hit, cfg.coarse_steps,
+                                      max(2.0 * offset, cfg.range_steps / 2.0),
+                                      cfg.z_travel_limit)
+
+        # Nothing sharp anywhere along the geometric sweep.  Either the focus cone
+        # was stepped over, or nothing in view can be focused at all - the spread
+        # of the scores tells the two apart.
+        if spread < cfg.gallop_signal:
+            self.log(f"[AF] no focus signal anywhere: best {spread:.1f}x the "
+                     f"worst sample across the whole travel - nothing in view "
+                     f"is in focus at any reachable Z")
+            return "nothing_sharp"
+        self.log(f"[AF] focus cone stepped over (best sample {spread:.1f}x the "
+                 f"rest at {best_z:+.0f}) -> rescanning that neighbourhood")
+        return self._bracket_walk(best_z, cfg.coarse_steps,
+                                  max(2.0 * best_off, cfg.range_steps / 2.0),
+                                  cfg.z_travel_limit)
 
     def _escalate(self, direction: str) -> tuple[float, float]:
         """Return a new window next to the exhausted one."""
@@ -784,18 +950,18 @@ class AutoFocus:
         self._pos = float(start_z)
         self._lo = self._hi = float(start_z)
 
+        # Walk outward from the best guess and stop as soon as the peak is
+        # bracketed, instead of always paying for a fixed window.
+        center = float(z_hint) if z_hint is not None else float(start_z)
         if z_hint is not None:
-            half = max(cfg.coarse_steps * 2, cfg.predictive_window / 2.0)
-            self.log(f"[AF] predictive window {z_hint - half:+.0f}.."
-                     f"{z_hint + half:+.0f} (hint {z_hint:+.0f})")
-            self._scan_window(z_hint - half, z_hint + half, cfg.coarse_steps)
+            self.log(f"[AF] expanding search from the predicted {center:+.0f} "
+                     f"(step {cfg.coarse_steps}, max {cfg.z_travel_limit})")
         else:
-            half = cfg.range_steps / 2.0
-            self.log(f"[AF] full scan {start_z - half:+.0f}..{start_z + half:+.0f} "
-                     f"step {cfg.coarse_steps} ({cfg.range_steps / self.steps_per_mm:.1f} mm)")
-            self._scan_window(start_z - half, start_z + half, cfg.coarse_steps)
+            self.log(f"[AF] expanding search from {center:+.0f} with no hint "
+                     f"(step {cfg.coarse_steps}, max {cfg.z_travel_limit})")
+        outcome = self._scan(center, hint=z_hint is not None)
 
-        if not len(self.stack):
+        if outcome == "no_frames" or not len(self.stack):
             raise FocusError(
                 "no frames captured during the focus scan - is the camera feed "
                 "running?")
@@ -805,52 +971,37 @@ class AutoFocus:
         #    the whole window is far out of it - the case where the old hill climb
         #    saw "no improvement" and declared the peak found.
         limited = ""
-        edge = ""
-        for _ in range(cfg.max_extensions):
+        if outcome in ("limit", "travel", "budget", "nothing_sharp") \
+                and not self.stack.bracketed():
+            # The walk never found a peak it could bracket: say which way it was
+            # still improving, because that is the direction the operator has to
+            # make reachable (more travel, or a smaller X step).
             q = self.stack.quality()
-            if q.size < 2:
-                break
-            hi, lo_end, hi_end = float(q.max()), float(q[0]), float(q[-1])
-            if self.stack.bracketed():
-                break                       # peak stands clear of both ends
-            if hi <= 0:
-                break                       # nothing measurable at all
-            # Not bracketed: follow the better end.  When both ends are equally
-            # (un)sharp the window is saturated - no gradient anywhere - so
-            # continue in the last direction travelled rather than oscillating.
-            if hi_end > lo_end * (1.0 + 1e-6):
-                edge = "pos"
-            elif lo_end > hi_end * (1.0 + 1e-6):
-                edge = "neg"
-            else:
-                edge = "pos" if self._last_dir > 0 else "neg"
-            try:
-                lo, hi = self._escalate(edge)
-                if abs(lo) > cfg.z_travel_limit or abs(hi) > cfg.z_travel_limit:
-                    limited = edge
-                    self.log(f"[AF] peak is at the {edge} edge and the travel "
-                             f"limit is reached - the true focus is outside "
-                             f"the reachable range")
-                    break
-                self.log(f"[AF] best sample on the {edge} edge -> extending the "
-                         f"search window")
-                self._scan_window(lo, hi, cfg.coarse_steps)
-            except FocusError as exc:
-                limited = edge
-                self.log(f"[AF] cannot extend: {exc}")
-                break
+            zs = np.asarray(self.stack.z, float)
+            if q.size:
+                order = np.argsort(zs)
+                q, zs = q[order], zs[order]
+                mid = float(np.mean(zs))
+                best_z = float(zs[int(np.argmax(q))])
+                limited = "pos" if best_z >= mid else "neg"
+                reach = abs(best_z - center) / self.steps_per_mm
+                self.log(f"[AF] no bracketed peak: the most promising sample is "
+                         f"{reach:.2f} mm {limited} of the start, after "
+                         f"{len(self.stack)} captures (outcome: {outcome}, "
+                         f"travel limit {cfg.z_travel_limit} steps)")
+                if outcome == "travel":
+                    self.log(f"[AF] travel limit reached at "
+                             f"{cfg.z_travel_limit} steps - the true focus is "
+                             f"outside the reachable range")
+                elif outcome == "limit":
+                    self.log(f"[AF] stopped after {cfg.range_steps} steps without "
+                             f"a bracketed peak - raise the range, or the focus "
+                             f"really is not in this part of the travel")
 
-        if edge and not self.stack.bracketed():
-            # the search ran out of extensions while still climbing towards a
-            # focus it never reached: the range is too small for this spot
-            limited = limited or edge
-            reach = cfg.range_steps * (cfg.max_extensions + 1) / self.steps_per_mm
-            self.log(f"[AF] gave up after {cfg.max_extensions} extensions while "
-                     f"still getting sharper towards {edge}: the true focus is "
-                     f"more than {reach:.1f} mm from the start, beyond what this "
-                     f"search covers - raise the range, or check the Z travel "
-                     f"limit ({cfg.z_travel_limit} steps)")
-
+        if not len(self.stack):
+            raise FocusError(
+                "no frames captured during the focus scan - is the camera feed "
+                "running?")
         if not self.stack.reliable().any():
             # Distinguish "nothing in view has texture" (a real error: point the
             # camera at the part) from "everything is so far out of focus that
@@ -863,16 +1014,21 @@ class AutoFocus:
             self.log("[AF] view has texture but no tile is sharp anywhere in the "
                      "searched range - reporting the result for what it is")
 
-        # 2. refine around the coarse optimum with a fine sweep
-        area = self.stack.area_in_focus()
-        zs = np.asarray(self.stack.z, float)
+        # 2. refine around the coarse optimum with a fine sweep.  The span is
+        #    deliberately narrow: the walk already bracketed the peak to within
+        #    one coarse step, so +-coarse/2 at the fine step is enough and costs
+        #    3-5 captures instead of 9.
+        z_order = np.asarray(self.stack.z, float)[np.argsort(self.stack.z)]
         i = self._best_index()
-        bracketed = self.stack.bracketed() and 0 < i < len(zs) - 1
-        if bracketed:
-            lo = zs[i] - cfg.coarse_steps
-            hi = zs[i] + cfg.coarse_steps
-            self.log(f"[AF] refining {lo:+.0f}..{hi:+.0f} step {cfg.fine_steps}")
-            self._scan_window(lo, hi, cfg.fine_steps, skip_sampled=True)
+        z_best_coarse = float(np.asarray(self.stack.z, float)[i])
+        if self.stack.bracketed() and cfg.fine_steps < cfg.coarse_steps:
+            nearest = int(np.argmin(np.abs(z_order - z_best_coarse)))
+            interior = 0 <= nearest < len(z_order) - 1
+            lo = z_best_coarse - cfg.coarse_steps * 0.5
+            hi = z_best_coarse + cfg.coarse_steps * 0.5
+            if interior:
+                self.log(f"[AF] refining {lo:+.0f}..{hi:+.0f} step {cfg.fine_steps}")
+                self._scan_window(lo, hi, cfg.fine_steps, skip_sampled=True)
 
         # 3. pick the winner over the whole stack, refine to sub-step, then sit
         #    on it (the stage is left exactly where the best image was taken -

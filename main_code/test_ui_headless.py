@@ -523,7 +523,7 @@ def main() -> int:
         app._wait_motion_stop = lambda timeout_s=10.0: True
         app._af_mode_var.set("Region-wise (recommended)")
         app.af_range_var.set("4000")
-        app.af_ext_var.set("2")
+        app.af_pred_var.set("600")
         app.af_limit_var.set("16000")
         app.af_y_c_var.set("200")
         app.af_y_f_var.set("50")

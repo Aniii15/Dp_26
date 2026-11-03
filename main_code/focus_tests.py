@@ -66,7 +66,7 @@ def render(z: float, tilt: float = 0.0, base: np.ndarray | None = None,
     err = focus_error(tex.shape, z, tilt)
     sigma = np.abs(err) * BLUR_PER_STEP
     out = tex.astype(np.float32)
-    edges = np.linspace(0.0, max(6.0, float(sigma.max())), 13)
+    edges = np.linspace(0.0, max(6.0, float(sigma.max())), 25)
     for i, (lo_s, hi_s) in enumerate(zip(edges[:-1], edges[1:])):
         # the last band must include its upper edge, or the most defocused
         # pixels are the only ones left unblurred - which makes the far field
@@ -187,21 +187,24 @@ def test_reports_when_focus_lies_outside_the_travel_limit():
     assert any("Z range is still too small" in r for r in res.recommendation())
 
 
-def test_extends_the_window_when_the_peak_is_on_an_edge():
-    """Focus just outside the default window: must escalate, not stop there."""
-    cfg = fe.FocusConfig(settle_s=0, range_steps=2000, coarse_steps=200,
-                         max_extensions=3)
+def test_reaches_focus_far_outside_the_configured_range():
+    """Focus well beyond range_steps/2: must be found, not declared absent."""
+    cfg = fe.FocusConfig(settle_s=0, range_steps=2000, coarse_steps=200)
     rig = Rig(focus_z=2600.0)                  # outside +/-1000 of the start
     logs: list[str] = []
     _, res = run_af(rig, cfg, logs=logs)
-    assert any("extending the search window" in m for m in logs), logs
     assert abs(res.z_peak - 2600) <= 150, res.z_peak
+    assert res.bracketed, res.curve_variation
     assert res.in_focus_area > 0.8, res.in_focus_area
+    # and it got there geometrically, not by marching the whole travel
+    assert any("steps out" in m or "rescanning that neighbourhood" in m
+               for m in logs), logs
+    assert res.samples < 40, res.samples
 
 
 def test_stops_at_the_travel_limit_instead_of_driving_into_the_part():
     cfg = fe.FocusConfig(settle_s=0, range_steps=2000, coarse_steps=200,
-                         max_extensions=10, z_travel_limit=3000)
+                         z_travel_limit=3000)
     rig = Rig(focus_z=99999.0)
     _, res = run_af(rig, cfg)
     assert max(rig.moves and [rig.pos]) <= 3000 + 1, rig.pos
@@ -219,8 +222,7 @@ def test_predictive_hint_costs_far_fewer_frames():
 
 def test_bad_hint_still_escalates_to_a_correct_answer():
     rig = Rig(focus_z=2500.0)
-    cfg = fe.FocusConfig(settle_s=0, range_steps=2000, coarse_steps=200,
-                         max_extensions=3)
+    cfg = fe.FocusConfig(settle_s=0, range_steps=2000, coarse_steps=200)
     _, res = run_af(rig, cfg, hint=0.0)
     assert abs(res.z_peak - 2500) <= 150, res.z_peak
 

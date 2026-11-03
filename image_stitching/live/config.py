@@ -152,6 +152,67 @@ class LiveConfig:
 
     # ── Blending ────────────────────────────────────────────────────────────
     feather_px: int = 64
+    feather_gamma: float = 2.0
+    """Exponent of the smoothstep blend ramp.  1 is the old linear profile, whose
+    gradient jumps at the feather limit and shows up as a seam on low-contrast
+    surfaces; 2-3 fades overlapping frames into each other instead."""
+
+    dead_luma: int = 10
+    """Luma at or below this is "not image" (clipped sensor border, dead corner).
+
+    Deliberately strict: rusty blade surface reads 30-90, an HDMI/sensor border
+    reads 0-8.  These pixels are excluded from blending and from the exposure
+    fit; including them is what produced the pale blocks in the delivered
+    mosaics (a near-black strip lifted by the 2x gain clip)."""
+
+    max_dead_frac: float = 0.55
+    """Above this much dead area the frame is a capture fault, not a border."""
+
+    axis_prior_strict: bool = True
+    """Reject a registration whose motion contradicts the commanded axis.
+
+    A serpentine sweep is never purely horizontal or vertical (rig skew, actuator
+    angle), so the prior is *learned* from the scan rather than assumed: each
+    axis's observed mean displacement and spread become the expected motion and
+    the tolerance.  A frame that matches somewhere else - the next periodic hole,
+    a reflection - is refused instead of blended in permanently."""
+
+    axis_min_samples: int = 3
+    """Observations of an axis before the prior may veto anything.  Until then it
+    only nudges the registration prior, which is always safe."""
+
+    axis_prior_rel_tol: float = 0.35
+    """Tolerance as a fraction of the learned step, on top of 3 sigma."""
+
+    scalar_gain: bool = False
+    """Ablation switch: correct exposure with a single scalar and no validity
+    mask, i.e. the behaviour that produced the pale blocks.  Used by the
+    regression reproducer; leave False in production."""
+
+    flatten_illumination: bool = True
+    """Divide out each frame's own smooth illumination profile before blending.
+
+    The light falls off across the field of view, so every frame carries the same
+    low-frequency brightness surface.  Being common to all frames, it cannot be
+    removed by matching frames to each other: a frame overlaps its neighbour over
+    part of its area, so matching fits the surface from that strip and
+    extrapolates the rest - and the extrapolation error is what showed up as
+    brighter rectangles in the delivered mosaics.  Measured per frame instead,
+    it is a measurement rather than a guess, and afterwards the only remaining
+    difference between frames is the exposure level, which the scalar gain
+    cancels exactly.  Set False for the old (rectangle-prone) behaviour."""
+
+    flatten_order: int = 4
+    """How much structure counts as illumination (polynomial order).
+
+    4 follows a light falloff and a vignette without chasing a scratch or a hole
+    row; 0 would disable the normalisation.  Raise it only if the corners of the
+    mosaic are still visibly dimmer than the middle."""
+
+    flatten_clip: float = 1.6
+    """Largest illumination correction (1.6 = +/-60 %).  A frame that would need
+    more than that is badly exposed, not lit unevenly."""
+
     exposure_gain_clip: tuple[float, float] = (0.75, 1.35)
     output_scale: float = 1.0
     """Scale of the saved mosaic (0.5 halves memory 4x for live previews)."""

@@ -191,6 +191,184 @@ def test_submit_is_asynchronous_and_finalize_writes_outputs(tmp_path):
     assert Path(str(tmp_path / "run_report.txt")).exists()
 
 
+# ── frame geometry: clipped borders are not image ────────────────────────────
+def test_clipped_border_is_excluded_from_the_valid_mask():
+    from live.frames import analyse_frame
+    img = texture()
+    frame = crop(img, 0).copy()
+    frame[:, int(frame.shape[1] * 0.85):] = 0          # dead right strip
+    geo = analyse_frame(frame)
+    assert geo.dead_frac > 0.05
+    assert geo.valid[:, -5:].max() == 0, "dead border marked as image"
+    assert geo.valid[:, :100].min() == 255, "live area cut away"
+    assert geo.box[2] <= int(frame.shape[1] * 0.87), geo.box
+
+
+def test_a_mostly_dead_frame_is_recognised_as_a_capture_fault():
+    from live.frames import analyse_frame
+    frame = crop(texture(), 0).copy()
+    frame[:] = 0
+    geo = analyse_frame(frame)
+    assert geo.dead_frac > 0.9
+
+
+def test_dark_parts_of_the_surface_are_not_cut_away():
+    """Holes and shadow are 20-60 luma: they must stay part of the image."""
+    from live.frames import analyse_frame
+    frame = crop(texture(), 0).copy()
+    geo = analyse_frame(frame)
+    assert geo.dead_frac < 0.01, geo.dead_frac
+    assert geo.valid.min() == 255
+
+
+def test_blend_weight_decays_inside_the_valid_area():
+    from live.frames import smooth_weight
+    mask = np.zeros((120, 120), np.uint8)
+    mask[10:-10, 10:-10] = 255
+    w = smooth_weight(mask, feather_px=20)
+    assert w[0, 0] == 0.0                      # outside: never blended
+    assert 0.9 < w[60, 60] <= 1.0              # deep inside: full weight
+    # and it is monotone on the way in, with no step at the feather limit
+    profile = w[60, 10:40]
+    assert np.all(np.diff(profile) >= -1e-6), profile
+    assert (np.diff(profile, 2).__abs__() < 0.05).all(), "weight has a kink"
+
+
+def test_illumination_is_flattened_without_touching_defects():
+    """The fix for the rectangles: remove the frame's own light falloff."""
+    from live.frames import flatten_illumination
+    h, w = 300, 400
+    yy, xx = np.mgrid[0:h, 0:w]
+    rng = np.random.default_rng(7)
+    flat = np.full((h, w), 120.0) + rng.normal(0, 12, (h, w))   # surface + grain
+    flat = np.clip(np.dstack([flat] * 3), 20, 235)
+    lit = np.clip(flat * (1.0 + 0.28 * (xx / w - 0.5))[:, :, None], 0, 255)
+    lit = lit.astype(np.uint8)
+    out = flatten_illumination(lit)
+    # the trend across the frame is gone ...
+    left_before = float(lit[:, :40].mean())
+    right_before = float(lit[:, -40:].mean())
+    left_after = float(out[:, :40].mean())
+    right_after = float(out[:, -40:].mean())
+    assert right_before / left_before > 1.2, (left_before, right_before)
+    assert abs(right_after / left_after - 1.0) < 0.08, (left_after, right_after)
+    # ... the overall level is kept ...
+    assert abs(float(out.mean()) - float(lit.mean())) < 12
+    # ... and fine detail survives
+    assert float(np.std(out.astype(np.float32) - lit.astype(np.float32))) < 20
+    detail_before = float(np.abs(np.diff(lit.astype(np.float32), axis=1)).mean())
+    detail_after = float(np.abs(np.diff(out.astype(np.float32), axis=1)).mean())
+    assert detail_after > 0.7 * detail_before, (detail_before, detail_after)
+
+
+def test_flattening_ignores_a_dead_border():
+    from live.frames import analyse_frame, flatten_illumination
+    img = texture()
+    frame = crop(img, 0).copy()
+    frame[:, int(frame.shape[1] * 0.8):] = 0            # dead right strip
+    geo = analyse_frame(frame)
+    out = flatten_illumination(frame, geo.valid)
+    live = geo.valid > 0
+    # the black strip must not drag the profile, so the live area keeps its level
+    assert abs(float(out[live].mean()) - float(frame[live].mean())) < 12
+
+
+def _scan_with_clipped_border(tmp_path, name, clip):
+    img = texture()
+    st = LiveStitcher(LiveConfig(flush_every=0),
+                      out_prefix=str(tmp_path / name), log=no_log)
+    try:
+        for dy in (0, 150, 300, 450):
+            f = crop(img, dy).copy()
+            if clip:
+                f[:, int(f.shape[1] * 0.8):] = 0        # dead right strip
+            st.submit(f, f"f{dy}", axis="Y")
+        st.wait_idle(60)
+        mosaic, cov, _lq = st.mosaic.render()
+        return mosaic, cov
+    finally:
+        st.stop()
+
+
+def test_a_clipped_border_does_not_change_the_mosaic(tmp_path):
+    """The delivered artefact: clipped pixels lifted by the gain clip.
+
+    The dead strip must be *masked*, not brightened: a scan whose frames lose
+    20 % of their width has to stitch to the same picture as a clean scan of the
+    same part (and must not stretch the canvas over the dead column).
+    """
+    clean, cov_clean = _scan_with_clipped_border(tmp_path, "clean", clip=False)
+    clipped, cov_clip = _scan_with_clipped_border(tmp_path, "clip", clip=True)
+    h = min(clean.shape[0], clipped.shape[0])
+    w = min(clean.shape[1], clipped.shape[1])
+    diff = np.abs(clean[:h, :w].astype(np.int16)
+                  - clipped[:h, :w].astype(np.int16)).mean(axis=2)
+    shared = (cov_clean[:h, :w] > 0) & (cov_clip[:h, :w] > 0)
+    assert shared.mean() > 0.9, "the two scans do not cover the same part"
+    assert diff[shared].mean() < 1.5, f"mean |diff| {diff[shared].mean():.1f}"
+    assert diff[shared].max() < 40, f"max |diff| {diff[shared].max()}"
+    # and the canvas is not widened by the dead column
+    assert clipped.shape[1] <= clean.shape[1] * 0.95, (
+        clean.shape, clipped.shape)
+
+
+# ── stage prior: learn the rig's real motion signature ──────────────────────
+def test_prior_learns_each_axis_separately():
+    from live.prior import StagePrior
+    p = StagePrior(min_samples=3)
+    for i in range(6):
+        p.observe("Y", (2.0 + i * 0.1, 250.0 + i))
+        p.observe("X", (230.0 + i, -4.0))
+    assert p.known("Y") and p.known("X")
+    assert p.expected("Y")[1] > 200 and abs(p.expected("Y")[0]) < 10
+    assert p.expected("X")[0] > 200 and abs(p.expected("X")[1]) < 10
+
+
+def test_prior_does_not_veto_until_it_has_evidence():
+    from live.prior import StagePrior
+    p = StagePrior(min_samples=3)
+    ok, why = p.check("Y", (500.0, -400.0))
+    assert ok and why == ""
+
+
+def test_prior_vetoes_a_step_that_is_off_its_axis():
+    from live.prior import StagePrior
+    p = StagePrior(min_samples=3)
+    for _ in range(5):
+        p.observe("Y", (3.0, 250.0))
+    ok, why = p.check("Y", (3.0, 252.0))
+    assert ok, why                                  # normal noise passes
+    ok, why = p.check("Y", (250.0, 3.0))            # X-shaped step on a Y move
+    assert not ok and "off_axis" in why, why
+
+
+def test_prior_tracks_a_drifting_axis():
+    """An open-loop actuator's step varies; the prior must follow, not ossify."""
+    from live.prior import StagePrior
+    p = StagePrior(min_samples=3, max_samples=10)
+    for i in range(10):
+        p.observe("Y", (0.0, 200.0 + 12 * i))
+    assert p.expected("Y")[1] > 240, p.expected("Y")
+    ok, _ = p.check("Y", (0.0, 320.0))
+    assert ok
+
+
+def test_pipeline_uses_the_axis_prior_to_place_a_serpentine_scan(tmp_path):
+    """Y frames advance in Y; the X turn is placed as X, not forced into Y."""
+    img = texture()
+    st = _pipeline(tmp_path, axis_min_samples=2)
+    try:
+        for i, dy in enumerate((0, 150, 300, 450)):
+            st.submit(crop(img, dy), f"y{i}", axis="Y")
+        st.wait_idle(60)
+        assert st.prior.known("Y"), st.prior.summary()
+        step = st.prior.expected("Y")
+        assert 100 < step[1] < 200, step
+        assert abs(step[0]) < 40, step
+    finally:
+        st.stop()
+
+
 # ── live preview (what the GUI polls) ────────────────────────────────────────
 def test_preview_empty_returns_none(tmp_path):
     st = _pipeline(tmp_path)

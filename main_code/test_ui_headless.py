@@ -17,6 +17,8 @@ with a display.  Run:  python test_ui_headless.py
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -507,6 +509,7 @@ def main() -> int:
         import focus_tests as ft
 
         rig = ft.Rig(focus_z=900.0, tilt=600.0)
+        saved_move_z = main3.move_z          # restored before returning
         main3.Z_STEPS_PER_MM = 1600
         app._get_frame = rig.capture           # camera
         moves = []
@@ -574,7 +577,145 @@ def main() -> int:
         w = app._focus_weight(rig.capture())
         assert w is not None and w.shape == (ft.H, ft.W), None if w is None else w.shape
         assert 0.0 <= float(w.min()) and float(w.max()) <= 1.0
+        main3.move_z = saved_move_z
+        main3.Z_STEPS_PER_MM = 1600
     check("GUI autofocus path (region engine, hint, weights)", gui_autofocus)
+
+    # 12. the emergency stop overrides whatever is running -----------------
+    def safety_latch():
+        import requests
+        main3._SAFETY.rearm()
+        sent = []
+
+        def sender():
+            sent.append(1)
+            return (len(sent) >= 2), "STOP"
+        main3._SAFETY.sender = sender
+
+        assert not main3._SAFETY.halted
+        main3._SAFETY.trip("test")
+        assert main3._SAFETY.halted
+        for _ in range(50):                 # the hardware stop runs in a thread
+            if main3._SAFETY.acknowledged:
+                break
+            time.sleep(0.02)
+        assert main3._SAFETY.acknowledged, "stop was never acknowledged"
+        assert len(sent) >= 2, "the stop was not retried until it landed"
+
+        # motion is refused while latched, and nothing reaches the network
+        calls = []
+        real_get = requests.get
+        requests.get = lambda *a, **k: calls.append(a) or type(
+            "R", (), {"text": "OK"})()
+        try:
+            for fn, args in ((main3.move_z, (10, 1)), (main3.move_x, (10, 1)),
+                             (main3.move_r, (10, 1)),
+                             (main3.move_actuator, ("down", 500, 70)),
+                             (main3.set_speed, (800,))):
+                try:
+                    ok, msg = fn(*args)
+                except main3.Halted:
+                    ok, msg = False, "Halted"
+                assert not ok, f"{fn.__name__} returned {ok!r}/{msg!r}"
+            assert not calls, f"latched stop still sent {calls}"
+        finally:
+            requests.get = real_get
+
+        # re-arming is the only way out, and it re-enables motion
+        main3._SAFETY.rearm()
+        assert not main3._SAFETY.halted
+        requests.get = lambda *a, **k: calls.append(a) or type(
+            "R", (), {"text": "OK"})()
+        try:
+            ok, _ = main3.move_z(10, 1)
+            assert ok and calls, "motion did not resume after re-arm"
+        finally:
+            requests.get = real_get
+    check("estop: latches, refuses motion, retries /stop, re-arms", safety_latch)
+
+    def safety_interrupts_a_wait():
+        """A stop wakes a sleeping scan immediately - not after the delay."""
+        main3._SAFETY.rearm()
+        main3._SAFETY.sender = lambda: (True, "STOP")
+        outcome = {}
+
+        def sleeper():
+            started = time.time()
+            try:
+                main3.haltable_sleep(30.0)
+                outcome["result"] = "slept"
+            except main3.Halted:
+                outcome["result"] = "aborted"
+            outcome["delay"] = time.time() - started
+
+        t = threading.Thread(target=sleeper, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        main3._SAFETY.trip("test")
+        t.join(5)
+        assert outcome.get("result") == "aborted", outcome
+        assert outcome["delay"] < 2.0, f"took {outcome['delay']:.1f}s to abort"
+        main3._SAFETY.rearm()
+    check("estop: a 30 s wait aborts in well under a second", safety_interrupts_a_wait)
+
+    def safety_aborts_a_running_sweep():
+        """The sweep unwinds mid-move instead of finishing the column."""
+        main3._SAFETY.rearm()
+        main3._SAFETY.sender = lambda: (True, "STOP")
+        finished, moves = [], []
+
+        def fake_move(direction, duration_ms, speed, log_fn=None):
+            moves.append(direction)
+            if len(moves) == 2:
+                main3._SAFETY.trip("operator")
+            return True, "OK"
+
+        saved = (main3.move_actuator, app._get_frame, app._save_sweep_image,
+                 main3.set_speed, app._wait_motion_stop, app._boundary_pct)
+        main3.move_actuator = fake_move
+        app._get_frame = lambda: np.zeros((48, 64, 3), np.uint8)
+        app._save_sweep_image = lambda *a, **k: None
+        app._boundary_pct = lambda *a, **k: {"left": 0.0, "right": 0.0,
+                                             "upper": 0.0, "lower": 0.0}
+        app._wait_motion_stop = lambda *a, **k: True
+        main3.set_speed = lambda *a, **k: (True, "OK")
+        try:
+            app._autosweep_running = True
+            app._sweep_worker()
+            app._poll_ui_queue()
+            finished.append(True)
+        finally:
+            (main3.move_actuator, app._get_frame, app._save_sweep_image,
+             main3.set_speed, app._wait_motion_stop, app._boundary_pct) = saved
+        assert finished, "the sweep worker did not return"
+        assert len(moves) <= 3, f"sweep kept moving after the stop: {moves}"
+        assert not app._autosweep_running, "sweep still marked running"
+        assert "HALTED" in app._autosweep_status.get(), app._autosweep_status.get()
+        main3._SAFETY.rearm()
+    check("estop: a running sweep unwinds mid-move", safety_aborts_a_running_sweep)
+
+    def safety_ui():
+        main3._SAFETY.rearm()
+        main3._SAFETY.sender = lambda: (True, "STOP")
+        app._emergency_stop()            # trip
+        app._poll_ui_queue()
+        assert main3._SAFETY.halted
+        assert "RE-ARM" in app.btn_estop.cget("text").upper()
+        assert str(app.btn_autosweep.cget("state")) == "disabled"
+        assert str(app.btn_af.cget("state")) == "disabled", \
+            "a motion control stayed live while latched"
+        # a latched machine refuses to start a new scan
+        app._autosweep_running = False
+        app._start_autosweep()
+        assert not app._autosweep_running, "sweep started while latched"
+        # pressing the same button re-arms and restores the controls
+        app._emergency_stop()
+        app._poll_ui_queue()
+        assert not main3._SAFETY.halted
+        assert "EMERGENCY STOP" in app.btn_estop.cget("text").upper()
+        assert str(app.btn_af.cget("state")) != "disabled", \
+            "controls were not restored on re-arm"
+    check("estop: button latches, disables motion, re-arms", safety_ui)
 
     print()
     if failures:

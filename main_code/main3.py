@@ -153,10 +153,143 @@ class MotionDetector:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  Emergency stop
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Halted(RuntimeError):
+    """Raised when a move, a wait or an autofocus is abandoned because the
+    emergency stop is latched.
+
+    Deliberately an exception rather than a flag the caller may forget to check:
+    a sweep is a deep nest of loops and callbacks, and every one of them has to
+    give up *immediately*, not at the next convenient milestone.
+    """
+
+
+class SafetyStop:
+    """Latched stop that overrides whatever the machine is doing.
+
+    A stop button that only asks the sweep loop to end is not a stop: the loop
+    could be inside a 1.5 s actuator move, an autofocus bracket, a settle delay
+    or an HTTP request, and any of those would run to completion first.  Worse,
+    a command already in flight could still arrive at the firmware afterwards.
+
+    So this object does three things, in this order:
+
+    1. **Latches.**  ``generation`` is bumped and ``halted`` is set, so anything
+       that was about to act can tell that its world is gone.
+    2. **Interrupts.**  Every wait in the scan goes through :func:`haltable_sleep`
+       / ``wait()``, which returns the instant the latch is set and raises
+       :class:`Halted`; every command goes through the guard in ``http_get``,
+       which refuses to send motion while latched.  Nothing that was queued can
+       sneak through after the stop.
+    3. **Kills the hardware.**  ``/stop`` is sent repeatedly (in its own thread,
+       so the UI never blocks) because one request can be lost while the
+       firmware is busy, and a stop that is only *attempted* is not a stop.
+
+    It stays latched until the operator explicitly re-arms: the machine does not
+    resume by itself, and no scheduled callback can restart it.
+    """
+
+    def __init__(self, sender=None, log=None):
+        self._lock = threading.Lock()
+        self._halted = threading.Event()
+        self._generation = 0
+        self.sender = sender
+        self._log = log
+        self.attempts = 0
+        self.acknowledged = False
+
+    # ── state ────────────────────────────────────────────────────────────────
+    @property
+    def halted(self) -> bool:
+        return self._halted.is_set()
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def checkpoint(self):
+        """Raise :class:`Halted` if the stop is latched."""
+        if self._halted.is_set():
+            raise Halted("emergency stop")
+
+    def wait(self, seconds: float) -> bool:
+        """Sleep, but wake immediately on a stop.  True if it was halted."""
+        if self._halted.wait(max(0.0, seconds)):
+            return True
+        return False
+
+    # ── transitions ──────────────────────────────────────────────────────────
+    def trip(self, reason: str = "operator") -> bool:
+        """Latch the stop.  Returns True if this call was the one that tripped it."""
+        with self._lock:
+            first = not self._halted.is_set()
+            self._generation += 1
+            self._halted.set()
+        if first and self._log:
+            self._log(f"⛔ EMERGENCY STOP latched ({reason}) — "
+                      f"all commands refused until re-armed")
+        threading.Thread(target=self._kill_hardware, daemon=True).start()
+        return first
+
+    def rearm(self) -> bool:
+        """Clear the latch.  Only the operator may do this."""
+        with self._lock:
+            if not self._halted.is_set():
+                return False
+            self._halted.clear()
+            self._generation += 1
+            self.attempts = 0
+            self.acknowledged = False
+        if self._log:
+            self._log("✅ Emergency stop re-armed — motion enabled")
+        return True
+
+    # ── hardware ─────────────────────────────────────────────────────────────
+    def _kill_hardware(self, tries: int = 4, gap: float = 0.25):
+        if self.sender is None:
+            return
+        for i in range(tries):
+            self.attempts = i + 1
+            try:
+                ok, resp = self.sender()
+            except Exception as exc:                  # noqa: BLE001
+                ok, resp = False, str(exc)
+            if ok:
+                self.acknowledged = True
+                if self._log:
+                    self._log(f"[SAFETY] hardware acknowledged stop ({resp})")
+                return
+            if self._log and i == tries - 1:
+                self._log(f"[SAFETY] ⚠ stop not acknowledged after {tries} "
+                          f"attempts: {resp} — the stage may keep moving")
+            time.sleep(gap)          # not haltable: this *is* the stop
+
+
+_SAFETY = SafetyStop()          # sender is wired once the HTTP layer exists
+
+# Endpoints that move hardware.  Refused outright while the stop is latched.
+MOTION_ENDPOINTS = frozenset({"/z", "/x", "/r", "/actuator", "/speed"})
+
+
+def haltable_sleep(seconds: float):
+    """``time.sleep`` that aborts the caller when the stop is latched."""
+    if _SAFETY.wait(seconds):
+        raise Halted("emergency stop")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  HTTP Communication Layer
 # ──────────────────────────────────────────────────────────────────────────────
 
 def http_get(endpoint: str, params: dict = None, log_fn=None) -> tuple[bool, str]:
+    if endpoint in MOTION_ENDPOINTS and _SAFETY.halted:
+        msg = f"refused: emergency stop is latched ({endpoint})"
+        if log_fn:
+            log_fn(f"[SAFETY] {msg}")
+        return False, msg
     url = f"{BASE_URL}{endpoint}"
     try:
         resp = requests.get(url, params=params, timeout=TIMEOUT_S)
@@ -176,27 +309,36 @@ def http_get(endpoint: str, params: dict = None, log_fn=None) -> tuple[bool, str
 
 
 def move_z(steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
+    _SAFETY.checkpoint()
     return http_get("/z", {"steps": steps, "dir": direction}, log_fn)
 
 
 def move_x(steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
+    _SAFETY.checkpoint()
     return http_get("/x", {"steps": steps, "dir": direction}, log_fn)
 
 
 def move_r(steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
+    _SAFETY.checkpoint()
     return http_get("/r", {"steps": steps, "dir": direction}, log_fn)
 
 
 def move_actuator(direction: str, duration_ms: int, speed: int, log_fn=None) -> tuple[bool, str]:
+    _SAFETY.checkpoint()
     return http_get("/actuator", {"dir": direction, "time": duration_ms, "speed": speed}, log_fn)
 
 
 def emergency_stop(log_fn=None) -> tuple[bool, str]:
+    """Ask the firmware to halt.  Never refused, latched or not."""
     return http_get("/stop", log_fn=log_fn)
 
 
 def set_speed(us: int, log_fn=None) -> tuple[bool, str]:
+    _SAFETY.checkpoint()
     return http_get("/speed", {"us": us}, log_fn)
+
+
+_SAFETY.sender = emergency_stop
 
 
 def ping_esp32(log_fn=None) -> bool:
@@ -595,10 +737,11 @@ class MotorControlApp(tk.Tk):
         ip_entry.pack(side="right")
         ip_entry.bind("<Return>", self._apply_ip)
 
-        tk.Button(self, text="⛔  EMERGENCY STOP", command=self._emergency_stop,
-                  bg=C["danger"], fg="white", font=("Consolas", 13, "bold"),
-                  relief="flat", padx=20, pady=6, cursor="hand2"
-                  ).pack(fill="x", padx=16, pady=(8, 4))
+        self.btn_estop = tk.Button(
+            self, text="⛔  EMERGENCY STOP", command=self._emergency_stop,
+            bg=C["danger"], fg="white", font=("Consolas", 13, "bold"),
+            relief="flat", padx=20, pady=6, cursor="hand2")
+        self.btn_estop.pack(fill="x", padx=16, pady=(8, 4))
 
     def _build_visuals(self):
         """Live feed beside the growing mosaic — both visible while sweeping."""
@@ -1572,7 +1715,7 @@ class MotorControlApp(tk.Tk):
 
         return _focus_engine.AutoFocus(
             move, self._get_frame, cfg, wait=wait, log=self._log,
-            sleep=time.sleep, steps_per_mm=Z_STEPS_PER_MM, origin=start_z)
+            sleep=haltable_sleep, steps_per_mm=Z_STEPS_PER_MM, origin=start_z)
 
     def _autofocus_regions(self, hint=None, u=None, v=None,
                            stack=None) -> "object | None":
@@ -1742,7 +1885,7 @@ class MotorControlApp(tk.Tk):
 
         def step_and_get(dir_mult, size):
             move_z(size, 1 if dir_mult > 0 else 0)
-            time.sleep(delay)
+            haltable_sleep(delay)
             return self._get_frame()
 
         try:
@@ -1786,6 +1929,8 @@ class MotorControlApp(tk.Tk):
                     img_current = img_next
 
             self._log("[AF] Peak focus locked")
+        except Halted:
+            raise                       # a stop is not an autofocus error
         except Exception as e:
             self._log(f"[AF] Error: {e}")
 
@@ -1793,7 +1938,14 @@ class MotorControlApp(tk.Tk):
 
     def _save_sweep_image(self, images_dir: str, column: int, phase: str,
                           frame=None, weight=None):
-        """Save the current frame (or a supplied stacked one) and stitch it."""
+        """Save the current frame (or a supplied stacked one) and stitch it.
+
+        The phase tag already says which axis produced the frame (``Ydown``,
+        ``Xr2``, ...), so the stitcher learns the machine's real per-axis step
+        instead of guessing: a serpentine sweep is never perfectly vertical, and
+        knowing which axis was commanded is what lets it reject a registration
+        that has locked onto the wrong feature.
+        """
         if frame is None:
             frame = self._get_frame()
             weight = self._focus_weight(frame) if frame is not None else None
@@ -1807,7 +1959,8 @@ class MotorControlApp(tk.Tk):
                 self._log(f"[SWEEP] Failed to save image: {filename}")
         except Exception as e:
             self._log(f"[SWEEP] Error saving image: {e}")
-        self._stitch_submit(frame, filename, weight)
+        axis = "X" if phase and phase[0] in "Xx" else "Y"
+        self._stitch_submit(frame, filename, weight, axis=axis)
 
     def _focus_weight(self, frame):
         """Per-pixel focus confidence for the stitcher's blend (or None).
@@ -1830,7 +1983,7 @@ class MotorControlApp(tk.Tk):
 
     # ── Live mosaic ───────────────────────────────────────────────────────────
 
-    def _stitch_submit(self, frame, filename: str, weight=None):
+    def _stitch_submit(self, frame, filename: str, weight=None, axis=None):
         """Hand a freshly captured frame to the streaming stitcher.
 
         Non-blocking: the stitcher runs its own worker thread, so motor timing
@@ -1838,6 +1991,8 @@ class MotorControlApp(tk.Tk):
         (blurry, duplicate, unregisterable) are logged but otherwise ignored.
         """
         if not LIVE_STITCH or frame is None:
+            return
+        if _SAFETY.halted:
             return
         try:
             if self._stitcher is None:
@@ -1857,9 +2012,9 @@ class MotorControlApp(tk.Tk):
                         out_dir, f"live_{time.strftime('%Y%m%d_%H%M%S')}"),
                     on_decision=self._on_stitch_decision,
                     log=lambda m: self._log(m))
-            meta = {"file": filename}
+            meta = {"file": filename, "axis": axis}
             self._stitcher.submit(frame, filename.rsplit(".", 1)[0], meta,
-                                  weight=weight)
+                                  weight=weight, axis=axis)
         except Exception as e:      # stitching must never break a scan
             self._log(f"[STITCH] disabled after error: {e}")
             self._stitcher = None
@@ -1898,6 +2053,10 @@ class MotorControlApp(tk.Tk):
     def _start_autosweep(self):
         if self._autosweep_running:
             return
+        if _SAFETY.halted:
+            self._log("[SWEEP] Refused: the emergency stop is latched - "
+                      "re-arm first")
+            return
         self._log("[SWEEP] Starting boundary-based autonomous scan")
         if self._stitcher is not None:
             self._stitch_finalize()      # don't mix two runs in one mosaic
@@ -1910,6 +2069,16 @@ class MotorControlApp(tk.Tk):
         threading.Thread(target=self._sweep_worker, daemon=True).start()
 
     def _sweep_worker(self):
+        try:
+            self._sweep_worker_inner()
+        except Halted:
+            self._log("[SWEEP] ⛔ aborted by the emergency stop")
+            self._post(lambda: self._autosweep_status.set("HALTED"))
+        finally:
+            self._autosweep_running = False
+            self._post(self._refresh_sweep_buttons)
+
+    def _sweep_worker_inner(self):
         """Serpentine scan: Y down to lower edge, X right, Y up to upper edge,
         X right, ... until the right edge of the blade is reached."""
         base_dir = os.path.join(os.path.dirname(__file__), "blade_images")
@@ -1936,7 +2105,7 @@ class MotorControlApp(tk.Tk):
             self.af_x_c_var, self.af_x_m_var, self.af_x_f_var, self.af_x_d_var, "X")
 
         set_speed(1000, self._log)
-        time.sleep(0.2)
+        haltable_sleep(0.2)
 
         column = 1
         column_times = []
@@ -1971,7 +2140,7 @@ class MotorControlApp(tk.Tk):
                               f"last stop ({len(self._focus_trend)} points)")
             self._autofocus(hint=hint, u=float(column), v=float(y_index[0]))
             y_index[0] += 1
-            time.sleep(0.5)
+            haltable_sleep(0.5)
             stacked = getattr(self, "_last_focus_stack", None)
             if stacked is not None:
                 frame, weight = stacked
@@ -1987,7 +2156,7 @@ class MotorControlApp(tk.Tk):
                 self._log(f"[SWEEP] Moving Y {direction} (attempt {i})")
                 move_actuator(direction, y_duration_ms, y_speed, self._log)
                 self._wait_motion_stop()
-                time.sleep(0.5)
+                haltable_sleep(0.5)
                 save(f"{prefix}_{i}")
                 if i % 4 == 0:
                     self._log("[SWEEP] Running AutoFocus after 4 Y moves")
@@ -2010,7 +2179,7 @@ class MotorControlApp(tk.Tk):
                 f"[SWEEP] Corrective Y {direction} shift ({y_correction_ms}ms)")
             move_actuator(direction, y_correction_ms, y_speed, self._log)
             self._wait_motion_stop()
-            time.sleep(0.5)
+            haltable_sleep(0.5)
             save(tag)
 
         def x_advance(tag):
@@ -2018,7 +2187,7 @@ class MotorControlApp(tk.Tk):
             self._log("[SWEEP] Moving X right")
             move_x(x_steps, 1, self._log)
             self._wait_motion_stop()
-            time.sleep(0.5)
+            haltable_sleep(0.5)
             save(f"{tag}_move")
             self._log("[SWEEP] Running AutoFocus after X move")
             # An X advance is 0.4 mm of sideways travel; the surface depth
@@ -2026,7 +2195,7 @@ class MotorControlApp(tk.Tk):
             # Passing no hint here made every column turn pay for a full search of
             # the whole Z travel - the single biggest cost in a sweep.
             self._autofocus(hint=0.0, u=float(column), v=float(y_index[0]))
-            time.sleep(0.5)
+            haltable_sleep(0.5)
             stacked = getattr(self, "_last_focus_stack", None)
             if stacked is not None:
                 save(f"{tag}_AF", stacked[0], stacked[1])
@@ -2117,7 +2286,7 @@ class MotorControlApp(tk.Tk):
             x_steps = mm_to_x_steps(0.4)
             y_speed = 70
             set_speed(1000, self._log)
-            time.sleep(0.2)
+            haltable_sleep(0.2)
 
             # Step 1: X left until left boundary > 20%
             set_status("Moving left...")
@@ -2125,7 +2294,7 @@ class MotorControlApp(tk.Tk):
                 self._log(f"[GSP] Moving X left (attempt {i})")
                 move_x(x_steps, 0, self._log)
                 self._wait_motion_stop()
-                time.sleep(0.5)
+                haltable_sleep(0.5)
                 pct = self._boundary_pct()
                 if pct is not None:
                     self._log(f"[GSP] Left boundary: {pct['left']:.1f}%")
@@ -2142,7 +2311,7 @@ class MotorControlApp(tk.Tk):
             self._log("[GSP] Step 2: Moving X right one time")
             move_x(x_steps, 1, self._log)
             self._wait_motion_stop()
-            time.sleep(0.5)
+            haltable_sleep(0.5)
 
             # Step 3: Y up until upper boundary > 20%
             set_status("Moving up...")
@@ -2150,7 +2319,7 @@ class MotorControlApp(tk.Tk):
                 self._log(f"[GSP] Moving Y up (attempt {i})")
                 move_actuator("up", 1200, y_speed, self._log)
                 self._wait_motion_stop()
-                time.sleep(0.5)
+                haltable_sleep(0.5)
                 pct = self._boundary_pct(UPPER_BOUNDARY_THRESHOLD)
                 if pct is not None:
                     self._log(f"[GSP] Upper boundary: {pct['upper']:.1f}%")
@@ -2167,7 +2336,7 @@ class MotorControlApp(tk.Tk):
             self._log("[GSP] Step 4: Moving Y down one time")
             move_actuator("down", 1500, y_speed, self._log)
             self._wait_motion_stop()
-            time.sleep(0.5)
+            haltable_sleep(0.5)
 
             self._log("[GSP] ✓ Starting point reached!")
             set_status("✓ Complete")
@@ -2219,7 +2388,7 @@ class MotorControlApp(tk.Tk):
         while not self._feed_stop_evt.is_set():
             ret, frame = cap.read()
             if not ret:
-                time.sleep(0.05)
+                haltable_sleep(0.05)
                 continue
 
             # Measure achieved capture FPS over ~1 s windows
@@ -2286,7 +2455,7 @@ class MotorControlApp(tk.Tk):
             if self._motion_detector.is_still():
                 self._log("[MOTION] Motor stopped (visual feedback)")
                 return True
-            time.sleep(0.05)
+            haltable_sleep(0.05)
         self._log(
             f"[MOTION] Timeout waiting for motor to stop (>{timeout_s}s)")
         return False
@@ -2458,9 +2627,99 @@ class MotorControlApp(tk.Tk):
                 fg=C["success"] if self._connected else C["danger"])
 
     def _emergency_stop(self):
-        self._log("⛔ EMERGENCY STOP SENT")
+        """Stop *everything*, now - or re-arm if it is already latched.
+
+        A stop that only asks the sweep loop to end is not a stop: the loop may
+        be inside a 1.5 s actuator move, an autofocus bracket or a settle delay,
+        and any of those would finish first, and a command already in flight
+        could still land.  So this latches a state that (a) makes every wait
+        return immediately, (b) makes every further motion command refuse to be
+        sent, and (c) hammers /stop at the firmware until it answers, in its own
+        thread so the window never freezes.  Nothing restarts until the operator
+        presses the button again.
+        """
+        if _SAFETY.halted:
+            _SAFETY.rearm()
+            self._post(self._refresh_safety_ui)
+            return
         self._autosweep_stop_evt.set()
-        self._threaded(emergency_stop, self._log)
+        _SAFETY.trip("operator")
+        self._log("⛔ EMERGENCY STOP — in-flight move abandoned, motion disabled")
+        self._post(self._refresh_safety_ui)
+
+    def _refresh_safety_ui(self):
+        """Reflect the latch on the Tk thread: button, controls, status."""
+        halted = _SAFETY.halted
+        try:
+            if halted:
+                self.btn_estop.configure(
+                    text="🔒  HALTED — click to RE-ARM",
+                    bg=C["warning"] if "warning" in C else C["danger"])
+                self._autosweep_status.set("HALTED — re-arm to move")
+            else:
+                self.btn_estop.configure(text="⛔  EMERGENCY STOP",
+                                         bg=C["danger"])
+                self._autosweep_status.set("Re-armed")
+                self._stitch_error_shown = False
+        except Exception as exc:              # noqa: BLE001
+            self._log(f"[SAFETY] UI update failed: {exc}")
+        self._set_motion_controls(not halted)
+        self._refresh_sweep_buttons()
+
+    def _set_motion_controls(self, enabled: bool):
+        """Disable every control that can move the machine while latched.
+
+        Walking the widget tree rather than keeping a hand-maintained list means
+        a control added later cannot be forgotten - the failure mode of a stop
+        button that silently leaves one button live.
+        """
+        estop = getattr(self, "btn_estop", None)
+
+        def walk(widget):
+            try:
+                children = widget.winfo_children()
+            except Exception:                 # noqa: BLE001
+                return
+            for child in children:
+                if child is estop:
+                    continue
+                try:
+                    state = str(child.cget("state"))
+                except Exception:             # frames, labels, panels
+                    walk(child)
+                    continue
+                if enabled:
+                    prev = getattr(child, "_pre_halt_state", None)
+                    if prev is not None:
+                        try:
+                            child.configure(state=prev)
+                        except Exception:     # noqa: BLE001
+                            pass
+                        child._pre_halt_state = None
+                elif state != "disabled":
+                    # a widget with no recorded state is enabled, and has to be
+                    # frozen too - forgetting one is how a stop button leaves a
+                    # control live
+                    child._pre_halt_state = state or "normal"
+                    try:
+                        child.configure(state="disabled")
+                    except Exception:         # noqa: BLE001
+                        pass
+                walk(child)
+
+        walk(self)
+
+    def _refresh_sweep_buttons(self):
+        """Sweep buttons follow the latch, not just the running flag."""
+        halted = _SAFETY.halted
+        running = self._autosweep_running
+        try:
+            self.btn_autosweep.configure(
+                state="disabled" if (running or halted) else "normal")
+            self.btn_stop_autosweep.configure(
+                state="normal" if (running and not halted) else "disabled")
+        except Exception:                     # noqa: BLE001
+            pass
 
     def _on_close(self):
         self._feed_stop_evt.set()

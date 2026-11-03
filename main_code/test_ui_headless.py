@@ -564,6 +564,12 @@ def main() -> int:
         assert hinted.bracketed, (hinted.z_peak, hinted.curve_variation)
         assert len(app._focus_trend) == 4, len(app._focus_trend)
 
+        # the result panel reports the Z footprint, so "it searches more range
+        # than needed" is measurable instead of a guess
+        detail = app._af_detail_var.get()
+        assert "searched" in detail and "travelled" in detail, detail
+        assert "cap" in detail, detail
+
         # and the weights handed to the stitcher are a real 0..1 map
         w = app._focus_weight(rig.capture())
         assert w is not None and w.shape == (ft.H, ft.W), None if w is None else w.shape

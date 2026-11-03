@@ -97,7 +97,15 @@ class FocusConfig:
     max_luma: float = 252.0          # blown-out tile
 
     # search
-    range_steps: int = 6000          # width of one search window (3.75 mm)
+    range_steps: int = 6000
+    """Cap on how far the search may walk from where it started, both directions
+    (so 6000 = +-3.75 mm around the start).
+
+    This is a *bound*, not a distance travelled: the scan stops as soon as the
+    peak is bracketed, and a prediction narrows it further.  Set it to ``0`` to
+    let the search use the whole of ``z_travel_limit`` - the right choice when
+    the part's depth envelope is unknown, a bad one when it is known and small,
+    because then every capture spent outside the envelope is pure cost."""
     coarse_steps: int = 200          # 0.125 mm
     fine_steps: int = 50             # 31 um
     fine_samples: int = 5            # samples per fine sweep (odd)
@@ -683,6 +691,9 @@ class AutoFocus:
         self._pos = float(origin)
         self._lo = self._hi = float(origin)
         self._last_dir = 1
+        self.travel_steps = 0.0      # total Z distance moved by this scan
+        self.captures = 0
+        self._anchor = float(origin)  # where the search window is centred
 
     @property
     def position(self) -> float:
@@ -713,6 +724,7 @@ class AutoFocus:
     def _move_raw(self, delta: float) -> None:
         if abs(delta) < 1:
             return
+        self.travel_steps += abs(delta)
         self.move(int(round(delta)))
         if self.wait is not None:
             self.wait()
@@ -729,8 +741,33 @@ class AutoFocus:
         frame = self.capture()
         if frame is None:
             return None
+        self.captures += 1
         self.stack.add(z, frame)
         return float(self.stack.area_in_focus()[-1])
+
+    def search_cap(self) -> float:
+        """Largest offset from the start the search may reach, in steps."""
+        if self.cfg.range_steps and self.cfg.range_steps > 0:
+            return min(float(self.cfg.range_steps) / 2.0,
+                       float(self.cfg.z_travel_limit))
+        return float(self.cfg.z_travel_limit)
+
+    def _search_window(self) -> tuple[float, float]:
+        """Absolute Z window this scan may sample, around where it started.
+
+        Bounding each walk by an offset from *its own* centre is not the same as
+        bounding the scan: a gallop may start 1 mm out and a walk from there adds
+        its own allowance, so the scan reached cap + allowance in practice.  One
+        window fixed at the start keeps ``range_steps`` an honest bound.
+        """
+        anchor = float(getattr(self, "_anchor", self._pos))
+        cap = self.search_cap()
+        lim = float(self.cfg.z_travel_limit)
+        return max(-lim, anchor - cap), min(lim, anchor + cap)
+
+    def _in_window(self, z: float) -> bool:
+        lo, hi = self._search_window()
+        return lo - 1e-6 <= z <= hi + 1e-6
 
     def _budget_left(self) -> bool:
         return len(self.stack) < self.cfg.max_samples
@@ -764,7 +801,8 @@ class AutoFocus:
         best = float(area.max() * 100) if area.size else -1.0
         self.log(f"[AF] scanned {lo:+.0f}..{hi:+.0f} (best so far {best:.0f}%)")
 
-    def _gallop(self, center: float, step: float, limit: float
+    def _gallop(self, center: float, step: float, limit: float,
+                max_offset: float | None = None
                 ) -> tuple[tuple[float, float] | None, float, float, float]:
         """Find *any* sharp Z cheaply, doubling the offset each round.
 
@@ -790,7 +828,7 @@ class AutoFocus:
             moved = False
             for sign in (1.0, -1.0):
                 z = center + sign * offset
-                if abs(z) > limit:
+                if not self._in_window(z):
                     continue
                 if not self._budget_left():
                     spread = best_q / worst_q if worst_q and worst_q > 0 else 1.0
@@ -832,6 +870,7 @@ class AutoFocus:
         closed = {"neg": False, "pos": False}
         announced = False
         hit_limit = False
+        hit_cap = False
         k = 0
         while True:
             k += 1
@@ -840,7 +879,7 @@ class AutoFocus:
                 if self.stack.bracketed():
                     return "bracketed"
                 return "travel" if hit_limit else "limit"
-            if offset > cfg.range_steps / 2.0 and not announced:
+            if offset > cfg.range_steps / 2.0 > 0 and not announced:
                 announced = True
                 self.log(f"[AF] still climbing past the configured range "
                          f"({cfg.range_steps} steps) -> extending the search window")
@@ -849,9 +888,10 @@ class AutoFocus:
                 if closed[side]:
                     continue
                 z = center + sign * offset
-                if abs(z) > limit:
+                if not self._in_window(z):
                     closed[side] = True
-                    hit_limit = True
+                    hit_limit = abs(z) > cfg.z_travel_limit
+                    hit_cap = hit_cap or not hit_limit
                     continue
                 if not self._budget_left():
                     self.log(f"[AF] stopped at the {cfg.max_samples}-sample "
@@ -866,6 +906,8 @@ class AutoFocus:
                 if float(q[-1]) < best * (1.0 - cfg.bracket_margin):
                     closed[side] = True
             if not moved:
+                if self.stack.bracketed():
+                    return "bracketed"
                 return "travel" if hit_limit else "limit"
             if closed["pos"] and closed["neg"]:
                 if self.stack.bracketed():
@@ -903,8 +945,7 @@ class AutoFocus:
             # walk must still be free to climb past it to the real peak, so its
             # allowance is the configured range, not the gallop's last offset.
             return self._bracket_walk(z_hit, cfg.coarse_steps,
-                                      max(2.0 * offset, cfg.range_steps / 2.0),
-                                      cfg.z_travel_limit)
+                                      self.search_cap(), cfg.z_travel_limit)
 
         # Nothing sharp anywhere along the geometric sweep.  Either the focus cone
         # was stepped over, or nothing in view can be focused at all - the spread
@@ -917,8 +958,7 @@ class AutoFocus:
         self.log(f"[AF] focus cone stepped over (best sample {spread:.1f}x the "
                  f"rest at {best_z:+.0f}) -> rescanning that neighbourhood")
         return self._bracket_walk(best_z, cfg.coarse_steps,
-                                  max(2.0 * best_off, cfg.range_steps / 2.0),
-                                  cfg.z_travel_limit)
+                                  self.search_cap(), cfg.z_travel_limit)
 
     def _escalate(self, direction: str) -> tuple[float, float]:
         """Return a new window next to the exhausted one."""
@@ -949,6 +989,9 @@ class AutoFocus:
         self.stack = FocusStack(cfg)
         self._pos = float(start_z)
         self._lo = self._hi = float(start_z)
+        self._anchor = float(start_z)
+        self.travel_steps = 0.0
+        self.captures = 0
 
         # Walk outward from the best guess and stop as soon as the peak is
         # bracketed, instead of always paying for a fixed window.
@@ -994,9 +1037,10 @@ class AutoFocus:
                              f"{cfg.z_travel_limit} steps - the true focus is "
                              f"outside the reachable range")
                 elif outcome == "limit":
-                    self.log(f"[AF] stopped after {cfg.range_steps} steps without "
-                             f"a bracketed peak - raise the range, or the focus "
-                             f"really is not in this part of the travel")
+                    self.log(f"[AF] stopped at the Range cap (+-{cfg.range_steps / 2 / self.steps_per_mm:.2f} mm, "
+                             f"{cfg.range_steps} steps) without a bracketed peak - "
+                             f"raise Range if the focus is further away, or 0 for "
+                             f"the whole travel")
 
         if not len(self.stack):
             raise FocusError(
@@ -1024,8 +1068,9 @@ class AutoFocus:
         if self.stack.bracketed() and cfg.fine_steps < cfg.coarse_steps:
             nearest = int(np.argmin(np.abs(z_order - z_best_coarse)))
             interior = 0 <= nearest < len(z_order) - 1
-            lo = z_best_coarse - cfg.coarse_steps * 0.5
-            hi = z_best_coarse + cfg.coarse_steps * 0.5
+            w_lo, w_hi = self._search_window()
+            lo = max(w_lo, z_best_coarse - cfg.coarse_steps * 0.5)
+            hi = min(w_hi, z_best_coarse + cfg.coarse_steps * 0.5)
             if interior:
                 self.log(f"[AF] refining {lo:+.0f}..{hi:+.0f} step {cfg.fine_steps}")
                 self._scan_window(lo, hi, cfg.fine_steps, skip_sampled=True)
@@ -1042,8 +1087,14 @@ class AutoFocus:
         self._goto(z_best)
         result = self.stack.result(z_peak=z_best - start_z, range_limited=limited)
         result.seconds = time.time() - t0
+        zs_seen = np.asarray(self.stack.z, float)
+        span = float(zs_seen.max() - zs_seen.min()) if zs_seen.size else 0.0
+        cap = self.search_cap()
         self.log(f"[AF] {result.summary(self.steps_per_mm)} "
                  f"in {result.seconds:.1f}s / {result.samples} frames")
+        self.log(f"[AF] searched +-{span / 2 / self.steps_per_mm:.2f} mm around the "
+                 f"start (cap +-{cap / self.steps_per_mm:.2f} mm), stage travelled "
+                 f"{self.travel_steps / self.steps_per_mm:.2f} mm in Z")
         for line in result.recommendation(self.steps_per_mm):
             self.log(f"[AF]   {line}")
         return result

@@ -69,7 +69,7 @@ path is normally good to a few hundred steps.
 | situation | what happens |
 |---|---|
 | peak bracketed by worse samples on both sides | reported as locked, with the numbers |
-| walk reaches the configured `range_steps` without a bracket | *"stopped after 6000 steps without a bracketed peak — raise the range, or the focus really is not in this part of the travel"* |
+| walk reaches the `Range cap` without a bracket | *"stopped at the Range cap (±1.88 mm, 6000 steps) without a bracketed peak — raise Range if the focus is further away, or 0 for the whole travel"* |
 | walk reaches `z_travel_limit` | *"travel limit reached … the true focus is outside the reachable range"* |
 | the gallop stepped over a narrow focus cone | detected by the *spread* of its scores (5-10×, not noise) and rescanned |
 | no signal anywhere (spread ≈ noise) | *"nothing in view is in focus at any reachable Z"* |
@@ -138,7 +138,7 @@ Every Z quantity is in motor steps on M1: **1600 steps = 1 mm**, so 200 steps =
 
 | Parameter (UI) | Config key | Default | What it does | Cost if you change it |
 |---|---|---|---|---|
-| `Range` | `range_steps` | 6000 (3.75 mm) | How far the bracket walk may wander before it reports "no bracketed peak". **Not** a distance it always travels — the walk stops when the peak is bracketed. | Sets the worst case only: making it smaller can turn "found" into "gave up", never makes a normal scan faster |
+| `Range cap` | `range_steps` | 6000 (±1.9 mm) | **Hard cap** on the whole search, either side of where the scan starts. `0` = use the whole `Travel limit`. Not a distance travelled — a scan stops as soon as the peak is bracketed | Sets the worst case *and* the bound: tighten it to the blade's real depth envelope and nothing outside that envelope is ever sampled |
 | `Predict window` | `predictive_window` | 600 | Width of the window confirmed when a prediction exists (±300). Skipped when it fails | Smaller = faster when the prediction is right, more fall-backs when it is wrong |
 | `C` (coarse) | `coarse_steps` | 200 (0.125 mm) | Step of the bracket walk, and the resolution to which focus is bracketed | Captures per side ≈ distance/C. 300 instead of 200 is ~35 % fewer captures and 0.19 mm resolution |
 | `F` (fine) | `fine_steps` | 50 (31 µm) | Step of the refinement pass | ~4-6 captures regardless; larger steps = less accurate final Z |
@@ -176,18 +176,23 @@ grab):
 
 What to change, in the order that pays:
 
-1. **Make sure a prediction is used.** A full search only happens at the first
-   stop of a column, or after a 1 mm jump. If the log says
-   `expanding search from +0 with no hint` repeatedly, the trend has too few
-   points — that is the expensive path.
-2. **`D` (settle) down.** 0.20 → 0.12 s removes 0.08 s × every capture. Check it
+1. **Set `Range cap` to the blade's depth envelope.** Use **📏 Measure depth of
+   field** once, read the reported *spread*, and set `Range cap` to roughly
+   2 × spread (the cap is ±, so ±spread is enough with margin). On a blade that
+   spans 1 mm of depth, `Range cap = 3000` makes wandering further physically
+   impossible instead of merely unlikely.
+2. **Make sure a prediction is used.** A full search only happens at the first
+   stop of a column, or after a big jump. If the log says
+   `with no hint` repeatedly, the trend has too few points — that is the
+   expensive path.
+3. **`D` (settle) down.** 0.20 → 0.12 s removes 0.08 s × every capture. Check it
    by eye once: if frames come out smeared, put it back up.
-3. **`C` (coarse) up.** 200 → 300 steps (0.19 mm) is still finer than the depth
+4. **`C` (coarse) up.** 200 → 300 steps (0.19 mm) is still finer than the depth
    of field of most setups and cuts the walk by a third.
-4. **`Predict window` down** (600 → 400) if the predictions are good.
-5. **`FOCUS_STACK_SAMPLES` 3** (already the default) and `FOCUS_STACKING` off if
+5. **`Predict window` down** (600 → 400) if the predictions are good.
+6. **`FOCUS_STACK_SAMPLES` 3** (already the default) and `FOCUS_STACKING` off if
    you would rather re-shoot the soft stops than pay 2 captures per stop.
-6. **Fewer autofocus calls per column**, which is a sweep decision rather than an
+7. **Fewer autofocus calls per column**, which is a sweep decision rather than an
    autofocus one: the sweep currently focuses after every 4th Y move plus at each
    column turn. Focusing after every 8th Y move halves the cost.
 
@@ -195,32 +200,54 @@ Use the **preset buttons** in the Focus tab: *Fast (sweeps)* = 4000/300/100/0.12
 *Balanced* = 6000/200/50/0.20 (defaults), *Accurate (single shot)* =
 8000/120/40/0.30.
 
-### "It searches a much bigger range on the X axis than needed"
+### "It searches a much bigger Z range than needed"
 
-Two separate things can produce that impression, and both were real:
+Until this was addressed there was **no knob for that**: `Range` bounded only the
+bracket walk, while the gallop that hunts for focus was bounded solely by
+`Travel limit` (15 mm by default). So a scan could and did wander far outside the
+part's depth envelope. Now:
 
-* **The range that is reported in the log is Z, not X.** `expanding search from
-  +0 … max 24000` is the *focus* travel in Z steps (1600/mm). An X column step is
-  0.4 mm of sideways motion and is never part of a focus scan.
-* **An X advance used to trigger a full-range Z search.** `x_advance()` called
+* **`Range cap` is a hard bound on everything** — gallop, walk and refinement.
+  Nothing outside `start ± Range cap/2` is ever sampled, which is enforced against
+  an absolute window anchored at the start of the scan (bounding each walk by an
+  offset from its *own* centre was not the same thing: a gallop could start 1 mm
+  out and the walk then add its own allowance on top).
+* **`0` means "whole travel"**, for when the envelope is genuinely unknown.
+* When the cap is what stopped the search it says so, in operator units:
+  *"stopped at the Range cap (±0.62 mm, 2000 steps) without a bracketed peak —
+  raise Range if the focus is further away, or 0 for the whole travel"*.
+* The result panel now reports the **footprint** of every scan:
+  `searched ±0.38 mm in Z, stage travelled 1.70 mm over 12 captures (cap ±0.94 mm)`.
+  That turns "it searches too much range" into a number you can act on.
+
+If a *predicted* stop still shows a full-range search, the trend has too few
+points (`len(trend) < 3`); that only happens on the first stop of a column.
+
+Two related things worth knowing:
+
+* The number in the log is **Z steps** (1600/mm), and it describes focus travel,
+  not the X axis. An X column step is 0.4 mm of sideways motion.
+* An X advance used to trigger a full-range Z search: `x_advance()` called
   autofocus with `hint=None`, so every column turn walked the whole Z travel even
   though the surface depth changes by far less than one coarse step over 0.4 mm of
-  X. It now passes `hint=0.0` — "focus is where you left it" — which is the
-  difference between 37 and 7 captures per column turn. If your log still shows a
-  full search after `Moving X right`, check that `FOCUS_MODE` is `region`.
+  X. It now passes `hint=0.0` — "focus is where you left it" — the difference
+  between 37 and 7 captures per column turn.
 
 ## Using it
 
 Focus tab → **Autofocus**:
 
 * `Engine` — *Region-wise (recommended)* or *CNN hill climb (legacy)*.
-* `Range` — how far the search may wander before reporting "no bracketed peak".
+* `Range cap` — hard limit on the whole Z search (±Range/2 from the start);
+  `0` searches the whole travel.
 * `Predict window` — width confirmed around a predicted focus.
 * `Travel limit` — refuse to drive Z further than this (safety).
 * `Backlash` — set to ~2× the measured backlash; the stage is then always
   approached from below, which matters for a 31 µm fine pass on a worn stage.
 * `C/M/F/D` — coarse / medium / fine step and settle delay.
-* `Preset` — *Fast (sweeps)* / *Balanced* / *Accurate (single shot)*.
+* `Preset` — *Fast (sweeps)* = ±0.94 mm cap / 0.19 mm walk / 0.12 s settle;
+  *Balanced* = ±1.9 mm / 0.125 mm / 0.20 s;
+  *Accurate (single shot)* = whole travel / 75 µm / 0.30 s.
 * **🎯 Auto-Focus Z** — one scan at the current position.
 * **📏 Measure depth of field** — a single scan that just reports DOF and the
   blade's depth spread. Run it once per blade type; the numbers tell you whether

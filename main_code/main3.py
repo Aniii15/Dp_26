@@ -79,7 +79,12 @@ UPPER_BOUNDARY_THRESHOLD = 50  # stricter threshold for upper-boundary checks
 # corrections near focus.
 FOCUS_MODE = "region"
 FOCUS_CONFIG = {
-    "range_steps": 6000,      # how far the search may wander before it reports
+    # Hard cap on the Z search, either side of where the scan starts (0 = as far
+    # as z_travel_limit).  This is a bound, not a distance: a scan stops as soon
+    # as the peak is bracketed, and a prediction narrows it further.  Set it to
+    # the blade's real depth envelope + margin once you know it - every capture
+    # outside that envelope is pure cost.
+    "range_steps": 6000,
     "coarse_steps": 200,      # 0.125 mm - resolution of the bracketing walk
     "fine_steps": 50,         # 31 um - refinement pass around the peak
     "z_travel_limit": 24000,  # 15 mm either way: refuse to drive further
@@ -1264,7 +1269,7 @@ class MotorControlApp(tk.Tk):
         self.af_backlash_var = tk.StringVar(
             value=str(FOCUS_CONFIG.get("backlash_steps", 0)))
         for label, var, width, suffix in (
-                ("Range:", self.af_range_var, 6, "steps"),
+                ("Range cap:", self.af_range_var, 6, "steps"),
                 ("Predict window:", self.af_pred_var, 5, "steps"),
                 ("Travel limit:", self.af_limit_var, 6, "steps"),
                 ("Backlash:", self.af_backlash_var, 4, "steps")):
@@ -1289,7 +1294,9 @@ class MotorControlApp(tk.Tk):
                            (self.af_x_c_var, self.af_x_m_var,
                             self.af_x_f_var, self.af_x_d_var))
         tk.Label(af, text="C = coarse step, M = medium, F = fine step, "
-                          "D = settle delay (s)",
+                          "D = settle delay (s).  Range cap 0 = whole travel; "
+                          "set it to the blade's depth envelope to stop the "
+                          "search wandering outside it.",
                  bg=C["panel"], fg=C["muted"], font=FONT_SMALL).pack(anchor="w")
 
         preset_row = tk.Frame(af, bg=C["panel"])
@@ -1632,8 +1639,18 @@ class MotorControlApp(tk.Tk):
         if not hasattr(self, "_af_result_var"):
             return
         self._af_result_var.set(result.summary(Z_STEPS_PER_MM))
-        self._af_detail_var.set("\n".join(
-            f"• {line}" for line in result.recommendation(Z_STEPS_PER_MM)))
+        lines = [f"• {line}" for line in result.recommendation(Z_STEPS_PER_MM)]
+        runner = getattr(self, "_last_focus_runner", None)
+        if runner is not None and getattr(runner, "stack", None) is not None:
+            zs = getattr(runner.stack, "z", [])
+            if zs:
+                span = (max(zs) - min(zs)) / Z_STEPS_PER_MM
+                lines.append(
+                    f"• searched ±{span / 2:.2f} mm in Z, stage travelled "
+                    f"{runner.travel_steps / Z_STEPS_PER_MM:.2f} mm over "
+                    f"{result.samples} captures "
+                    f"(cap ±{self._focus_cfg().range_steps / 2 / Z_STEPS_PER_MM:.2f} mm)")
+        self._af_detail_var.set("\n".join(lines))
         colour = C["success"] if (result.bracketed
                                   and result.in_focus_area >= 0.6) else C["warn"]
         if not result.bracketed:
@@ -1650,12 +1667,12 @@ class MotorControlApp(tk.Tk):
     # wants speed on hundreds of stops; a single-shot focus before a capture
     # wants accuracy and can afford a finer walk.
     _FOCUS_PRESETS = {
-        "fast": {"range": "4000", "coarse": "300", "fine": "100", "settle": "0.12",
-                 "note": "Fast: 0.19 mm walk, 0.12 s settle — for long sweeps"},
+        "fast": {"range": "3000", "coarse": "300", "fine": "100", "settle": "0.12",
+                 "note": "Fast: ±0.94 mm cap, 0.19 mm walk, 0.12 s settle"},
         "balanced": {"range": "6000", "coarse": "200", "fine": "50", "settle": "0.20",
-                     "note": "Balanced: 0.125 mm walk, 0.20 s settle"},
-        "accurate": {"range": "8000", "coarse": "120", "fine": "40", "settle": "0.30",
-                     "note": "Accurate: 75 um walk, 0.30 s settle — for single shots"},
+                     "note": "Balanced: ±1.9 mm cap, 0.125 mm walk, 0.20 s settle"},
+        "accurate": {"range": "0", "coarse": "120", "fine": "40", "settle": "0.30",
+                     "note": "Accurate: whole travel, 75 um walk, 0.30 s settle"},
     }
 
     def _apply_focus_preset(self, name: str):

@@ -187,9 +187,13 @@ def test_reports_when_focus_lies_outside_the_travel_limit():
     assert any("Z range is still too small" in r for r in res.recommendation())
 
 
-def test_reaches_focus_far_outside_the_configured_range():
-    """Focus well beyond range_steps/2: must be found, not declared absent."""
-    cfg = fe.FocusConfig(settle_s=0, range_steps=2000, coarse_steps=200)
+def test_reaches_focus_far_outside_the_default_window():
+    """Focus well beyond a nominal +-1 mm window must be found, not declared absent.
+
+    ``range_steps=0`` is the "search the whole travel" setting; a finite value is
+    a deliberate cap and is tested separately.
+    """
+    cfg = fe.FocusConfig(settle_s=0, range_steps=0, coarse_steps=200)
     rig = Rig(focus_z=2600.0)                  # outside +/-1000 of the start
     logs: list[str] = []
     _, res = run_af(rig, cfg, logs=logs)
@@ -211,6 +215,56 @@ def test_stops_at_the_travel_limit_instead_of_driving_into_the_part():
     assert res.range_limited
 
 
+def test_range_cap_is_a_hard_bound():
+    """If the operator says "focus is within +-0.6 mm", don't walk past it."""
+    cfg = fe.FocusConfig(settle_s=0, range_steps=2000)      # +-1000 steps
+    rig = Rig(focus_z=1500.0)                               # outside the cap
+    _, res = run_af(rig, cfg)
+    sampled = abs(rig.pos)
+    assert res.bracketed is False
+    assert res.range_limited == "pos", res.range_limited
+    assert abs(res.z_peak) <= 1000 + 200, res.z_peak
+    assert sampled <= 1000 + 400, sampled
+    # and the advice says which knob to turn
+    assert any("Range" in line or "Z range" in line
+               for line in res.recommendation()), res.recommendation()
+
+
+def test_nothing_is_sampled_outside_the_range_cap():
+    cfg = fe.FocusConfig(settle_s=0, range_steps=1600)      # +-800 steps
+    rig = Rig(focus_z=2500.0)
+    af, _res = run_af(rig, cfg)
+    worst = max(abs(z) for z in af.stack.z)
+    assert worst <= 800 + 1, worst
+
+
+def test_range_zero_means_the_whole_travel():
+    cfg = fe.FocusConfig(settle_s=0, range_steps=0, z_travel_limit=12000)
+    rig = Rig(focus_z=4200.0)
+    _, res = run_af(rig, cfg)
+    assert res.bracketed, res.curve_variation
+    assert abs(res.z_peak - 4200) <= 150, res.z_peak
+
+
+def test_a_focus_inside_the_cap_is_still_found_with_a_small_cap():
+    cfg = fe.FocusConfig(settle_s=0, range_steps=2000)
+    rig = Rig(focus_z=300.0)                                # well inside +-1000
+    _, res = run_af(rig, cfg)
+    assert res.bracketed and abs(res.z_peak - 300) <= 80, res.z_peak
+
+
+def test_footprint_is_reported():
+    """The scan must be able to say how much Z it actually used."""
+    rig = Rig(focus_z=900.0)
+    af, res = run_af(rig, fe.FocusConfig(settle_s=0))
+    assert af.travel_steps > 0
+    assert af.captures == res.samples > 0
+    span = max(af.stack.z) - min(af.stack.z)
+    assert span > 0
+    # travel is the path walked, so it can never be shorter than the span
+    assert af.travel_steps >= span * 0.9, (af.travel_steps, span)
+
+
 def test_predictive_hint_costs_far_fewer_frames():
     rig = Rig(focus_z=300.0)
     _, full = run_af(rig, fe.FocusConfig(settle_s=0))
@@ -222,7 +276,7 @@ def test_predictive_hint_costs_far_fewer_frames():
 
 def test_bad_hint_still_escalates_to_a_correct_answer():
     rig = Rig(focus_z=2500.0)
-    cfg = fe.FocusConfig(settle_s=0, range_steps=2000, coarse_steps=200)
+    cfg = fe.FocusConfig(settle_s=0, range_steps=0, coarse_steps=200)
     _, res = run_af(rig, cfg, hint=0.0)
     assert abs(res.z_peak - 2500) <= 150, res.z_peak
 

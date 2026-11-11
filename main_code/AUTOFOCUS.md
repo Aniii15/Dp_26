@@ -48,6 +48,25 @@ blown-out specular) are excluded from voting, judged relative to the best tile i
 view rather than by an absolute threshold — a blurred blade still has 3× the
 luma-banding of a blank wall.
 
+### Focus on the left 40 % of the view (`roi`)
+`FocusConfig.roi = (x0, y0, x1, y1)` (fractions) lays the tile grid over that
+rectangle only, so the peak, the area-in-focus and the depth spread all describe
+that region. The sweep uses `FOCUS_CONFIG["roi"] = (0.0, 0.0, 0.40, 1.0)`,
+shown as a yellow box on the live feed.
+
+Why: measured over a whole scan, sharpness falls 5-10x from the left-centre of
+the frame to the right edge in *every* frame - the blade curves away from the
+lens on the right, so no single Z makes the frame sharp. Optimising the whole
+frame trades the sharp left for a half-sharp middle. The right side is covered
+again one X step later by the *left* part of the next strip, and the global
+stitcher picks the sharpest view of every spot, so a reliably sharp left band
+per frame is what the mosaic needs.
+
+Stacking (`compose_focus_stack`) and the stitch weights (`tile_weight_map`)
+ignore the ROI and always use the whole frame. Tests:
+`test_roi_*` in `focus_tests.py` (left vs right ROI land ±0.3·tilt apart on a
+tilted synthetic blade, exactly where those regions are sharp).
+
 ### The search: gallop → bracket → refine
 Three stages, each of which stops as soon as it knows enough:
 

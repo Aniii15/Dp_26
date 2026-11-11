@@ -4,10 +4,12 @@ import glob
 # Initialize the ORB detector to quickly find features
 orb = cv2.ORB_create()
 # Minimum number of features required to keep the image (you can tweak this)
-MIN_FEATURES = 30
+MIN_FEATURES = 25
 
 # 1. Find all jpeg images in your data folder
-image_paths = glob.glob("test_images/*.*")
+# image_paths = glob.glob("scan_20261103_203842/*.*")
+image_paths = glob.glob(
+    "image_stitching/using_opencv_funcn/scan_20261103_203842/*.*")
 images_to_merge = []
 
 # 2. Read every image, check for features, and add it to the list
@@ -36,7 +38,7 @@ stitcher = cv2.Stitcher_create(cv2.Stitcher_SCANS)
 status, stitched_image = stitcher.stitch(images_to_merge)
 
 if status == cv2.Stitcher_OK:
-    cv2.imwrite("massive_combined_image2.jpeg", stitched_image)
+    cv2.imwrite("massive_combined_image3.jpeg", stitched_image)
     print("Success! All images merged into one.")
 else:
     print(f"Stitching failed with error code: {status}")

@@ -293,6 +293,11 @@ def _install_stub_tk():
     mb.showwarning = lambda *a, **k: None
     mb.askyesno = lambda *a, **k: True
 
+    fd = types.ModuleType("tkinter.filedialog")
+    fd.askdirectory = lambda *a, **k: ""          # "cancelled"
+    fd.askopenfilename = lambda *a, **k: ""
+    tk.filedialog = fd
+
     const = types.ModuleType("tkinter.constants")
     for name in ("END", "LEFT", "RIGHT", "TOP", "BOTTOM", "X", "Y", "BOTH",
                  "N", "S", "E", "W", "NW", "NSEW", "HORIZONTAL", "VERTICAL",
@@ -305,6 +310,7 @@ def _install_stub_tk():
         "tkinter.ttk": ttk,
         "tkinter.scrolledtext": st,
         "tkinter.messagebox": mb,
+        "tkinter.filedialog": fd,
         "tkinter.constants": const,
     })
     return tk
@@ -324,6 +330,11 @@ def main() -> int:
     _install_stub_net()
 
     import main3
+
+    # PIL's ImageTk.PhotoImage needs a real Tk interpreter; the stub has none.
+    if getattr(main3, "HAS_PIL", False):
+        main3.ImageTk = types.SimpleNamespace(
+            PhotoImage=lambda image=None, **kw: ("photo", getattr(image, "size", None)))
 
     failures: list[str] = []
 
@@ -494,7 +505,7 @@ def main() -> int:
     check("_post/_poll_ui_queue hand-off (and error containment)", ui_queue)
 
     def no_cross_thread_after():
-        src = (HERE / "main3.py").read_text()
+        src = (HERE / "main3.py").read_text(encoding="utf-8")
         # Tk's after() must never be called from a worker thread
         assert "after(0," not in src, "cross-thread self.after(0, ...) found"
     check("no cross-thread after() left in main3.py", no_cross_thread_after)
@@ -507,6 +518,11 @@ def main() -> int:
         import focus_tests as ft
 
         rig = ft.Rig(focus_z=900.0, tilt=600.0)
+        # The GUI focuses on FOCUS_CONFIG["roi"] (left 40 % by default).  On
+        # the rig's tilted plane, err = (z - focus) + tilt * x with x in
+        # [-0.5, 0.5], so the ROI is sharp at z = focus - tilt * x_roi_centre.
+        roi = tuple(main3.FOCUS_CONFIG.get("roi", (0.0, 0.0, 1.0, 1.0)))
+        roi_shift = -600.0 * ((roi[0] + roi[2]) / 2.0 - 0.5)
         main3.Z_STEPS_PER_MM = 1600
         app._get_frame = rig.capture           # camera
         moves = []
@@ -533,7 +549,7 @@ def main() -> int:
         res = app._autofocus()
         app._poll_ui_queue()          # the real app drains this 20x/second
         assert res is not None, "region engine returned nothing"
-        assert abs(res.z_peak - 900) <= 120, res.z_peak
+        assert abs(res.z_peak - (900 + roi_shift)) <= 120, (res.z_peak, roi_shift)
         assert res.bracketed, res.curve_variation
         assert app._af_result_var.get() != "not focused yet"
         assert app._af_detail_var.get().startswith("•")
@@ -560,7 +576,7 @@ def main() -> int:
         hinted = app._autofocus(hint=shift, u=1.0, v=3.0)
         app._poll_ui_queue()
         assert hinted is not None, "hinted scan returned nothing"
-        assert abs(hinted.z_peak - 700) <= 150, hinted.z_peak
+        assert abs(hinted.z_peak - (700 + roi_shift)) <= 150, (hinted.z_peak, roi_shift)
         assert hinted.bracketed, (hinted.z_peak, hinted.curve_variation)
         assert len(app._focus_trend) == 4, len(app._focus_trend)
 

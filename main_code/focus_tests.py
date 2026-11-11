@@ -467,6 +467,54 @@ def test_tile_weight_map_penalises_blurred_regions():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  region of interest (focus on the left of the view)
+# ──────────────────────────────────────────────────────────────────────────────
+
+LEFT40 = (0.0, 0.0, 0.4, 1.0)
+
+
+def test_roi_tiles_stay_inside_the_roi():
+    cfg = fe.FocusConfig(roi=LEFT40)
+    boxes = fe.tile_bounds((1080, 1920), cfg)
+    assert len(boxes) == cfg.tiles_x * cfg.tiles_y
+    assert max(x1 for _, _, _, x1 in boxes) <= int(0.4 * 1920)
+    assert min(x0 for _, _, x0, _ in boxes) >= int(cfg.margin * 1920)
+    # default is still the whole frame
+    full = fe.tile_bounds((1080, 1920), fe.FocusConfig())
+    assert max(x1 for _, _, _, x1 in full) > 1800
+
+
+def test_roi_focuses_the_left_of_a_tilted_blade():
+    """Tilted focal plane: the left 40 % is in focus ~0.3*tilt from the centre.
+
+    The ROI search must land there, and a right-hand ROI must land on the
+    other side - i.e. the ROI really steers the search.  (The whole-frame
+    objective is flat on a uniformly tilted plane, so it is no reference.)"""
+    tilt, focus = 1200.0, 300.0
+    # err = (z - focus) + tilt * x, x in [-0.5, 0.5]; left ROI centre x = -0.3
+    want_left, want_right = focus + 0.3 * tilt, focus - 0.3 * tilt
+    _, left = run_af(Rig(focus_z=focus, tilt=tilt),
+                     fe.FocusConfig(settle_s=0, roi=LEFT40))
+    _, right = run_af(Rig(focus_z=focus, tilt=tilt),
+                      fe.FocusConfig(settle_s=0, roi=(0.6, 0.0, 1.0, 1.0)))
+    assert abs(left.z_peak - want_left) <= 120, (left.z_peak, want_left)
+    assert abs(right.z_peak - want_right) <= 120, (right.z_peak, want_right)
+    assert left.bracketed and right.bracketed
+
+
+def test_roi_does_not_change_stacking_or_stitch_weights():
+    """Composition and stitch weights must still look at the whole frame."""
+    img = render(-400.0, tilt=900.0)
+    w_full, _ = fe.tile_weight_map(img, fe.FocusConfig())
+    w_roi, _ = fe.tile_weight_map(img, fe.FocusConfig(roi=LEFT40))
+    assert np.allclose(w_full, w_roi)
+    frames = [render(z, tilt=900.0) for z in (-300.0, 0.0, 300.0)]
+    c_full, _ = fe.compose_focus_stack(frames, fe.FocusConfig())
+    c_roi, _ = fe.compose_focus_stack(frames, fe.FocusConfig(roi=LEFT40))
+    assert np.array_equal(c_full, c_roi)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  trend prediction
 # ──────────────────────────────────────────────────────────────────────────────
 

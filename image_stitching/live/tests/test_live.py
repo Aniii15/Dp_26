@@ -104,7 +104,7 @@ def test_defocus_is_visible_to_the_sharpness_measure():
 # ── mosaic ───────────────────────────────────────────────────────────────────
 def test_mosaic_places_and_averages():
     img = texture()
-    cfg = LiveConfig(flush_every=0)
+    cfg = LiveConfig(flush_every=0, lens_radius_frac=0)   # synthetic: no optics
     mo = IncrementalMosaic(cfg)
     mo.add(img, np.eye(3))
     T = np.array([[1, 0, 0], [0, 1, 300], [0, 0, 1]], float)
@@ -121,7 +121,7 @@ def test_soft_frame_only_fills_holes():
     """A soft fill-in must never overwrite pixels that are already good."""
     img = texture()
     soft = cv2.GaussianBlur(img, (0, 0), 4.0)
-    mo = IncrementalMosaic(LiveConfig(flush_every=0))
+    mo = IncrementalMosaic(LiveConfig(flush_every=0, lens_radius_frac=0))
     mo.add(img, np.eye(3))
     T = np.array([[1, 0, 0], [0, 1, 300], [0, 0, 1]], float)
     res = mo.add(soft, T, empty_only=True, low_quality=True)
@@ -134,6 +134,7 @@ def test_soft_frame_only_fills_holes():
 
 # ── pipeline ─────────────────────────────────────────────────────────────────
 def _pipeline(tmp_path, **kw):
+    kw.setdefault("lens_radius_frac", 0)          # synthetic frames: no optics
     return LiveStitcher(LiveConfig(flush_every=0, **kw),
                         out_prefix=str(tmp_path / "run"), log=no_log)
 
@@ -263,6 +264,80 @@ def test_flush_writes_a_snapshot_mid_scan(tmp_path):
         assert Path(paths["png"]).exists()
         # the scan can keep going after a manual snapshot
         assert st.process(crop(img, 300), "c").ok
+    finally:
+        st.stop()
+
+
+# ── lens, scale, gating, dead reckoning ─────────────────────────────────────
+def test_lens_mask_keeps_clipped_corners_out_of_the_mosaic():
+    """This camera's right corners are black in every frame (outside the
+    image circle).  They must not be blended - they made dark wedges."""
+    img = texture(1080, 1920)
+    yy, xx = np.mgrid[0:1080, 0:1920]
+    img[np.hypot(xx - 960, yy - 540) > 0.56 * 1920] = 0      # optical clipping
+    mo = IncrementalMosaic(LiveConfig(flush_every=0))         # default lens on
+    mo.add(img, np.eye(3))
+    mosaic, coverage, _ = mo.render()
+    assert coverage[540, 960] > 0
+    assert coverage[0, -1] == 0 and coverage[-1, -1] == 0, "clipped corner blended"
+    # and nothing black leaks in from the rim
+    inside = coverage > 0
+    assert mosaic[inside].mean(axis=1).min() > 5
+
+
+def test_accum_scale_really_shrinks_the_canvas():
+    img = texture()
+    full = IncrementalMosaic(LiveConfig(flush_every=0, lens_radius_frac=0))
+    half = IncrementalMosaic(LiveConfig(flush_every=0, lens_radius_frac=0,
+                                        accum_scale=0.5))
+    T = np.array([[1, 0, 0], [0, 1, 300], [0, 0, 1]], float)
+    for mo in (full, half):
+        mo.add(img, np.eye(3))
+        mo.add(img, T)
+    a, _, _ = full.render()
+    b, _, _ = half.render()
+    assert abs(b.shape[0] - a.shape[0] / 2) <= 2 and abs(b.shape[1] - a.shape[1] / 2) <= 2
+    assert half._wsum.size < 0.5 * full._wsum.size       # memory, not just pixels
+    assert half.bbox() == full.bbox() or         all(abs(p - q) <= 2 for p, q in zip(half.bbox(), full.bbox()))
+
+
+def test_bandpass_ncc_catches_a_wrong_shift_that_plain_ncc_accepts():
+    """Measured on the real scans: a 77 px misregistration still scores plain
+    NCC ~0.90 because illumination dominates.  Band-passed NCC must not."""
+    img = texture(900, 900)
+    yy, xx = np.mgrid[0:400, 0:600].astype(np.float32)
+    shade = 0.35 + 0.65 * np.exp(-((xx - 300) ** 2 + (yy - 200) ** 2) / (2 * 260.0 ** 2))
+    a = (crop(img, 0) * shade[:, :, None] * 0.6 + 60 * shade[:, :, None]).astype(np.uint8)
+    b = (crop(img, 150) * shade[:, :, None] * 0.6 + 60 * shade[:, :, None]).astype(np.uint8)
+    cfg = LiveConfig(work_width=600)
+    reg = Registrar(cfg)
+    reg.prepare("a", a)
+    reg.prepare("b", b)
+    r = reg.register("a", "b")
+    assert r is not None and abs(r.shift[1] - 150) < 3
+    assert r.ncc_hp > 0.5, r.ncc_hp
+    from live.registration import highpass
+    wrong = r.affine.copy()
+    wrong[1, 2] += 40
+    plain, _ = reg._verify(reg.work_gray("a"), reg.work_gray("b"), wrong)
+    hp, _ = reg._verify(highpass(reg.work_gray("a")), highpass(reg.work_gray("b")),
+                        wrong, centered=True)
+    assert plain > 0.5, plain                  # plain NCC is fooled ...
+    assert hp < cfg.min_ncc_hp, hp             # ... band-passed NCC is not
+
+
+def test_unregisterable_frame_is_dead_reckoned_not_dropped(tmp_path):
+    img = texture()
+    other = texture(seed=99)                   # sharp, but unrelated content
+    st = _pipeline(tmp_path)
+    try:
+        st.process(crop(img, 0), "a")
+        st.process(crop(img, 100), "b")
+        d = st.process(crop(other, 150), "c")
+        assert d.ok and d.status == "filled", (d.status, d.reason)
+        assert d.method == "dead_reckoned"
+        assert abs(d.pose[1, 2] - 200) < 15, d.pose      # last pose + last step
+        assert st.mosaic.disconnected == 0
     finally:
         st.stop()
 

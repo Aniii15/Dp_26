@@ -12,8 +12,9 @@ boundary-guided sweep that saves images per column.
 """
 
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, ttk
+from tkinter import scrolledtext, messagebox, ttk, filedialog
 import threading
+import csv
 import time
 import queue
 import os
@@ -57,7 +58,7 @@ X_STEPS_PER_MM = 800
 R_STEPS_PER_REV = 1600
 DEGREES_PER_STEP = 360 / R_STEPS_PER_REV
 
-CAMERA_INDEX = 1               # OpenCV capture index of the HDMI card
+CAMERA_INDEX = 0               # OpenCV capture index of the HDMI card
 
 # Motion detection tuning (live-adjustable from the UI)
 MOTION_THRESHOLD = 20000   # changed-pixel count that counts as motion
@@ -92,7 +93,13 @@ FOCUS_CONFIG = {
     "backlash_steps": 0,      # set to ~2x the measured backlash if Z is sloppy
     "in_focus_ratio": 0.90,   # tile counts as focused at 90 % of its own best
     "max_samples": 60,        # hard cap on captures per focus scan
-    "predictive_window": 600, # window confirmed around a predicted focus
+    "predictive_window": 600,  # window confirmed around a predicted focus
+    # Focus on the LEFT 40 % of the view (x0, y0, x1, y1 as fractions).  The
+    # blade curves away from the lens towards the right, so no single Z makes
+    # the whole frame sharp; the right side is seen again - by the sharp left
+    # part of the next strip - one X step later, and the global stitcher picks
+    # the sharpest view of every spot.  (1.0, 1.0) corner = whole frame.
+    "roi": (0.0, 0.0, 0.40, 1.0),
 }
 # Bracket + fuse a Z-stack whenever a single Z cannot make the whole frame sharp.
 FOCUS_STACKING = True
@@ -108,6 +115,19 @@ LIVE_STITCH_CONFIG = {
     "flush_every": 10,      # write a partial mosaic every N accepted frames
     "output_scale": 1.0,    # 0.5 halves mosaic memory 4x for very large parts
     "anchors": 2,           # frames registered against, for drift control
+    # The live mosaic is a preview: the deliverable is the global stitch made
+    # from every saved frame after the sweep.  Half resolution keeps the
+    # preview fast and well inside memory (no more "canvas_full").
+    "accum_scale": 0.5,
+}
+
+# After every sweep, re-stitch the whole scan folder with the global stitcher
+# (image_stitching/live/global_stitch.py): every frame is used, poses are
+# solved over all overlaps at once, and the blend has no blocks.  Runs in the
+# background; the result replaces the live preview in the mosaic panel.
+GLOBAL_STITCH = True
+GLOBAL_STITCH_CONFIG = {
+    "output_scale": 1.0,    # 0.5 for a quick look at very large parts
 }
 
 
@@ -122,6 +142,7 @@ class MotionDetector:
         self._last_gray = None
         self._moving = False
         self._still_count = 0
+        self._last_motion = 0.0
         self._lock = threading.Lock()
 
     def process_frame(self, frame_bgr):
@@ -137,6 +158,7 @@ class MotionDetector:
             if motion_pixels > MOTION_THRESHOLD:
                 self._still_count = 0
                 self._moving = True
+                self._last_motion = time.time()
             else:
                 self._still_count += 1
                 if self._still_count >= STILLNESS_FRAMES:
@@ -150,6 +172,11 @@ class MotionDetector:
     def is_still(self) -> bool:
         with self._lock:
             return not self._moving and self._still_count >= STILLNESS_FRAMES
+
+    def motion_since(self, t: float) -> bool:
+        """Has any motion been seen after time ``t``?"""
+        with self._lock:
+            return self._last_motion >= t
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -370,6 +397,17 @@ def detect_boundaries(frame_bgr, threshold=None) -> tuple[int, int, int, int] | 
     return x, x + w, y, y + h
 
 
+def draw_focus_roi(frame, roi) -> np.ndarray:
+    """Outline the autofocus region (fractions x0, y0, x1, y1) in yellow."""
+    if not roi or tuple(roi) == (0.0, 0.0, 1.0, 1.0):
+        return frame
+    h, w = frame.shape[:2]
+    x0, y0, x1, y1 = roi
+    cv2.rectangle(frame, (int(x0 * w) + 2, int(y0 * h) + 2),
+                  (int(x1 * w) - 2, int(y1 * h) - 2), (0, 215, 255), 2)
+    return frame
+
+
 def draw_boundaries(frame, boundaries) -> np.ndarray:
     """Draw green boundary lines on frame."""
     if boundaries is None:
@@ -450,6 +488,8 @@ class MotorControlApp(tk.Tk):
         # Streaming mosaic (optional; enabled by LIVE_STITCH)
         self._stitcher = None
         self._stitcher_dir = None
+        self._capture_log = None         # (path, seq) of the running sweep
+        self._global_running = False
         self._mosaic_pending = False     # a preview fetch is in flight
         self._focus_trend = None         # FocusTrend, created with the engine
         self._focus_result = None        # last FocusResult, for the Focus tab
@@ -530,7 +570,8 @@ class MotorControlApp(tk.Tk):
                         foreground=C["muted"], padding=(16, 7), borderwidth=0,
                         font=FONT_LABEL)
         style.map("TNotebook.Tab",
-                  background=[("selected", C["panel"]), ("active", C["btn_bg"])],
+                  background=[("selected", C["panel"]),
+                              ("active", C["btn_bg"])],
                   foreground=[("selected", C["accent"]), ("active", C["text"])])
 
     def _section(self, parent, text, color=None, pady=(10, 4)):
@@ -649,6 +690,8 @@ class MotorControlApp(tk.Tk):
         self._make_btn(hdr, "Folder", self._open_mosaic_folder).pack(
             side="right", padx=2)
         self._make_btn(hdr, "Save now", self._stitch_snapshot).pack(
+            side="right", padx=2)
+        self._make_btn(hdr, "Re-stitch scan…", self._choose_and_restitch).pack(
             side="right", padx=2)
 
         tk.Frame(inner, bg=C["border"], height=1).pack(fill="x", pady=4)
@@ -798,7 +841,8 @@ class MotorControlApp(tk.Tk):
             return
         flagged = getattr(decision, "flagged", False)
         label = "FILL" if flagged else ("KEEP" if decision.ok else "DROP")
-        colour = C["warn"] if flagged else (C["success"] if decision.ok else C["danger"])
+        colour = C["warn"] if flagged else (
+            C["success"] if decision.ok else C["danger"])
         self._last_stitch_var.set(
             f"{label}  {decision.tag}  ·  {decision.reason or 'ok'}")
         self._last_stitch_label.configure(fg=colour)
@@ -1135,7 +1179,8 @@ class MotorControlApp(tk.Tk):
         tk.Label(size_row, text="%  of panel width", bg=C["panel"], fg=C["muted"],
                  font=FONT_SMALL).pack(side="left")
 
-        tk.Label(inner, text="■ middle third = sharpness ROI",
+        tk.Label(inner, text="■ yellow box = autofocus region "
+                             f"(FOCUS_CONFIG['roi'] = {FOCUS_CONFIG.get('roi')})",
                  bg=C["panel"], fg=C["warn"], font=FONT_SMALL).pack(anchor="w", pady=(0, 4))
 
         self._feed_label = tk.Label(inner, bg=C["bg"], anchor="nw")
@@ -1262,10 +1307,12 @@ class MotorControlApp(tk.Tk):
         # region-wise parameters
         rw = tk.Frame(af, bg=C["panel"])
         rw.pack(fill="x", pady=2)
-        self.af_range_var = tk.StringVar(value=str(FOCUS_CONFIG["range_steps"]))
+        self.af_range_var = tk.StringVar(
+            value=str(FOCUS_CONFIG["range_steps"]))
         self.af_pred_var = tk.StringVar(
             value=str(FOCUS_CONFIG.get("predictive_window", 600)))
-        self.af_limit_var = tk.StringVar(value=str(FOCUS_CONFIG["z_travel_limit"]))
+        self.af_limit_var = tk.StringVar(
+            value=str(FOCUS_CONFIG["z_travel_limit"]))
         self.af_backlash_var = tk.StringVar(
             value=str(FOCUS_CONFIG.get("backlash_steps", 0)))
         for label, var, width, suffix in (
@@ -1435,7 +1482,8 @@ class MotorControlApp(tk.Tk):
         hdr.pack(fill="x")
         tk.Label(hdr, text="▸ LOG", bg=C["panel"], fg=C["accent"],
                  font=FONT_TITLE).pack(side="left", padx=6, pady=4)
-        self._make_btn(hdr, "Clear", self._clear_log).pack(side="right", padx=4)
+        self._make_btn(hdr, "Clear", self._clear_log).pack(
+            side="right", padx=4)
 
         wrap = tk.Frame(holder, bg=C["border"], padx=1, pady=1)
         wrap.pack(fill="both", expand=True, pady=(2, 0))
@@ -1515,12 +1563,12 @@ class MotorControlApp(tk.Tk):
             return
 
         def worker():
-            self._post( lambda: self.btn_af.configure(
+            self._post(lambda: self.btn_af.configure(
                 state="disabled", text="⏳ Focusing..."))
             try:
                 self._autofocus(steps, delay)
             finally:
-                self._post( lambda: self.btn_af.configure(
+                self._post(lambda: self.btn_af.configure(
                     state="normal", text="🎯 Auto-Focus Z"))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1544,6 +1592,7 @@ class MotorControlApp(tk.Tk):
         """Build a FocusConfig from the current UI values."""
         if _focus_engine is None:
             return None
+
         def num(var, fallback):
             try:
                 return float(var.get())
@@ -1554,8 +1603,9 @@ class MotorControlApp(tk.Tk):
         base["coarse_steps"] = int(num(self.af_y_c_var, base["coarse_steps"]))
         base["fine_steps"] = int(num(self.af_y_f_var, base["fine_steps"]))
         base["predictive_window"] = int(num(self.af_pred_var,
-                                           base["predictive_window"]))
-        base["z_travel_limit"] = int(num(self.af_limit_var, base["z_travel_limit"]))
+                                            base["predictive_window"]))
+        base["z_travel_limit"] = int(
+            num(self.af_limit_var, base["z_travel_limit"]))
         base["settle_s"] = num(self.af_y_d_var, base["settle_s"])
         base["backlash_steps"] = int(num(self.af_backlash_var, 0))
         return _focus_engine.FocusConfig(**base)
@@ -1578,7 +1628,8 @@ class MotorControlApp(tk.Tk):
                            stack=None) -> "object | None":
         """Scan a wide Z range, score it per region, and say what it found."""
         if _focus_engine is None:
-            self._log("[AF] focus_engine.py is missing — falling back to the CNN")
+            self._log(
+                "[AF] focus_engine.py is missing — falling back to the CNN")
             return self._autofocus_cnn([1600, 800, 400], 2.0)
         if self._get_frame() is None:
             self._log("[AF] No feed available, aborting autofocus")
@@ -1799,15 +1850,40 @@ class MotorControlApp(tk.Tk):
             weight = self._focus_weight(frame) if frame is not None else None
         if frame is None:
             return
+        filename = f"col{column:02d}_{phase}_{time.strftime('%H%M%S')}.jpg"
         try:
-            filename = f"col{column:02d}_{phase}_{time.strftime('%H%M%S')}.jpg"
-            if cv2.imwrite(os.path.join(images_dir, filename), frame):
+            if cv2.imwrite(os.path.join(images_dir, filename), frame,
+                           [cv2.IMWRITE_JPEG_QUALITY, 95]):
                 self._log(f"[SWEEP] Image saved: {filename}")
+                self._log_capture(images_dir, filename, column, phase)
             else:
                 self._log(f"[SWEEP] Failed to save image: {filename}")
         except Exception as e:
             self._log(f"[SWEEP] Error saving image: {e}")
         self._stitch_submit(frame, filename, weight)
+
+    def _log_capture(self, images_dir: str, filename: str, column: int,
+                     phase: str):
+        """Append to <scan>/capture_log.csv: the exact capture order.
+
+        File names only carry HH:MM:SS, so frames saved in the same second (an
+        AF frame and the next step) and scans across midnight are ambiguous.
+        The global stitcher reads this log when it exists.  Every saved frame is
+        listed - nothing the live stitcher rejects is ever removed."""
+        try:
+            path = os.path.join(images_dir, "capture_log.csv")
+            if self._capture_log is None or self._capture_log[0] != path:
+                self._capture_log = [path, 0]
+            self._capture_log[1] += 1
+            new = not os.path.exists(path)
+            with open(path, "a", newline="") as f:
+                wr = csv.writer(f)
+                if new:
+                    wr.writerow(["seq", "file", "column", "phase", "t"])
+                wr.writerow([self._capture_log[1], filename, column, phase,
+                             f"{time.time():.3f}"])
+        except Exception as exc:                    # never break a scan
+            self._log(f"[SWEEP] capture log not written: {exc}")
 
     def _focus_weight(self, frame):
         """Per-pixel focus confidence for the stitcher's blend (or None).
@@ -1877,6 +1953,71 @@ class MotorControlApp(tk.Tk):
                 f"-> {paths.get('png')}")
         except Exception as e:
             self._log(f"[STITCH] finalize failed: {e}")
+
+    # ── Global (after-the-scan) stitch ───────────────────────────────────────
+
+    def _choose_and_restitch(self):
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "blade_images")
+        folder = filedialog.askdirectory(
+            title="Scan folder to re-stitch",
+            initialdir=base if os.path.isdir(base) else None)
+        if folder:
+            self._start_global_stitch(folder)
+
+    def _start_global_stitch(self, images_dir: str):
+        """Re-stitch a whole scan folder in the background."""
+        if self._global_running:
+            self._log("[GLOBAL] a re-stitch is already running")
+            return
+        if not images_dir or not os.path.isdir(images_dir):
+            self._log(f"[GLOBAL] no such folder: {images_dir}")
+            return
+        self._global_running = True
+
+        def work():
+            try:
+                sys.path.insert(0, os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..", "image_stitching"))
+                from live.global_stitch import GlobalConfig, stitch_folder
+                out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "blade_mosaic")
+                os.makedirs(out_dir, exist_ok=True)
+                name = os.path.basename(os.path.normpath(images_dir))
+                prefix = os.path.join(out_dir, f"global_{name}")
+                self._log(f"[GLOBAL] re-stitching every frame of {images_dir} "
+                          "(this takes a few minutes)")
+                paths = stitch_folder(images_dir, prefix,
+                                      GlobalConfig(**GLOBAL_STITCH_CONFIG),
+                                      log=lambda m: self._log(m))
+                self._log(f"[GLOBAL] mosaic {paths.get('shape')} -> {paths.get('jpg')}")
+                self._show_mosaic_file(paths.get("jpg"))
+            except Exception as exc:            # never take the GUI down
+                self._log(f"[GLOBAL] re-stitch failed: {exc}")
+            finally:
+                self._global_running = False
+
+        threading.Thread(target=work, daemon=True, name="global-stitch").start()
+
+    def _show_mosaic_file(self, path):
+        """Show a finished mosaic file in the mosaic panel (worker thread)."""
+        if not path or not os.path.exists(path):
+            return
+        img = cv2.imread(path)
+        if img is None:
+            return
+        k = 900.0 / max(img.shape[0], 1)
+        if k < 1:
+            img = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        summary = {"accepted": 0, "filled": 0, "rejected": 0, "disconnected": 0,
+                   "mean_ncc": 0.0, "canvas": (0, 0, img.shape[1], img.shape[0])}
+
+        def paint():
+            self._mosaic_render(rgb, summary)
+            self._mosaic_stat_var.set(f"global stitch: {os.path.basename(path)}")
+        self._post(paint)
 
     def _boundary_pct(self, detect_threshold=None) -> dict | None:
         """Blade boundary distances from frame edges in percent, or None if no frame."""
@@ -1957,7 +2098,8 @@ class MotorControlApp(tk.Tk):
             """Focus, save what the focus produced (possibly a Z-stack)."""
             hint = None
             if self._focus_trend is not None:
-                pred = self._focus_trend.predict(float(column), float(y_index[0]))
+                pred = self._focus_trend.predict(
+                    float(column), float(y_index[0]))
                 if pred is None and self._focus_result is not None:
                     # too few points to fit a trend: the previous stop's answer is
                     # still a far better guess than "search the whole travel"
@@ -1985,8 +2127,9 @@ class MotorControlApp(tk.Tk):
                 if stop.is_set():
                     return False
                 self._log(f"[SWEEP] Moving Y {direction} (attempt {i})")
+                t_cmd = time.time()
                 move_actuator(direction, y_duration_ms, y_speed, self._log)
-                self._wait_motion_stop()
+                self._wait_move_done(t_cmd, y_duration_ms / 1000.0)
                 time.sleep(0.5)
                 save(f"{prefix}_{i}")
                 if i % 4 == 0:
@@ -1996,7 +2139,7 @@ class MotorControlApp(tk.Tk):
                 if pct is not None:
                     self._log(
                         f"[SWEEP] {edge.title()} boundary: {pct[edge]:.1f}%")
-                    self._post( lambda p=pct[edge], e=edge:
+                    self._post(lambda p=pct[edge], e=edge:
                                self._autosweep_status.set(f"{e.title()}: {p:.1f}%"))
                     if pct[edge] > edge_pct:
                         self._log(f"[SWEEP] ✓ {edge.title()} boundary detected "
@@ -2008,16 +2151,18 @@ class MotorControlApp(tk.Tk):
         def y_correct(direction, tag):
             self._log(
                 f"[SWEEP] Corrective Y {direction} shift ({y_correction_ms}ms)")
+            t_cmd = time.time()
             move_actuator(direction, y_correction_ms, y_speed, self._log)
-            self._wait_motion_stop()
+            self._wait_move_done(t_cmd, y_correction_ms / 1000.0)
             time.sleep(0.5)
             save(tag)
 
         def x_advance(tag):
             """Move X right + autofocus. True when the right boundary is reached."""
             self._log("[SWEEP] Moving X right")
+            t_cmd = time.time()
             move_x(x_steps, 1, self._log)
-            self._wait_motion_stop()
+            self._wait_move_done(t_cmd)
             time.sleep(0.5)
             save(f"{tag}_move")
             self._log("[SWEEP] Running AutoFocus after X move")
@@ -2038,7 +2183,7 @@ class MotorControlApp(tk.Tk):
                 if pct["right"] > RIGHT_PCT:
                     self._log(
                         "[SWEEP] ✓ Right boundary reached — scan complete")
-                    self._post( lambda: self._autosweep_status.set(
+                    self._post(lambda: self._autosweep_status.set(
                         "Right boundary reached - Done"))
                     return True
             return False
@@ -2049,7 +2194,7 @@ class MotorControlApp(tk.Tk):
             self._autosweep_column_start_time = column_start
             self._autosweep_column_num = column
             self._log(f"\n[SWEEP] === Column {column} ===")
-            self._post( lambda c=column, e=elapsed:
+            self._post(lambda c=column, e=elapsed:
                        self._autosweep_status.set(f"Column {c} | {e // 60}m {e % 60}s"))
 
             if not y_sweep("down", "lower", LOWER_PCT, None, "Ydown"):
@@ -2085,6 +2230,8 @@ class MotorControlApp(tk.Tk):
             f"[SWEEP] Scan complete or stopped. Total time: {elapsed // 60}m {elapsed % 60}s")
         self._log("[STITCH] writing final mosaic...")
         self._stitch_finalize()
+        if GLOBAL_STITCH:
+            self._start_global_stitch(images_dir)
         for n, t in enumerate(column_times, 1):
             self._log(f"[SWEEP]   Column {n}: {t // 60}m {t % 60}s")
         if column_times:
@@ -2092,12 +2239,12 @@ class MotorControlApp(tk.Tk):
             self._log(
                 f"[SWEEP]   Average per column: {avg // 60}m {avg % 60}s")
         self._autosweep_running = False
-        self._post( lambda e=elapsed: self._autosweep_status.set(
+        self._post(lambda e=elapsed: self._autosweep_status.set(
             f"Complete | {e // 60}m {e % 60}s"))
-        self._post( lambda e=elapsed: self._autosweep_timer_var.set(
+        self._post(lambda e=elapsed: self._autosweep_timer_var.set(
             f"⏱ Final total: {e // 60}m {e % 60}s"))
-        self._post( lambda: self.btn_autosweep.configure(state="normal"))
-        self._post( lambda: self.btn_stop_autosweep.configure(
+        self._post(lambda: self.btn_autosweep.configure(state="normal"))
+        self._post(lambda: self.btn_stop_autosweep.configure(
             state="disabled"))
 
     # ── Calibration: Go to Starting Point ─────────────────────────────────────
@@ -2111,7 +2258,7 @@ class MotorControlApp(tk.Tk):
     def _gsp_worker(self):
         """Drive X left then Y up to the blade's top-left corner."""
         def set_status(text):
-            self._post( lambda: self._gsp_status.set(text))
+            self._post(lambda: self._gsp_status.set(text))
 
         try:
             x_steps = mm_to_x_steps(0.4)
@@ -2123,8 +2270,9 @@ class MotorControlApp(tk.Tk):
             set_status("Moving left...")
             for i in range(1, 101):
                 self._log(f"[GSP] Moving X left (attempt {i})")
+                t_cmd = time.time()
                 move_x(x_steps, 0, self._log)
-                self._wait_motion_stop()
+                self._wait_move_done(t_cmd)
                 time.sleep(0.5)
                 pct = self._boundary_pct()
                 if pct is not None:
@@ -2140,16 +2288,18 @@ class MotorControlApp(tk.Tk):
             # Step 2: one X step back right
             set_status("Moving right...")
             self._log("[GSP] Step 2: Moving X right one time")
+            t_cmd = time.time()
             move_x(x_steps, 1, self._log)
-            self._wait_motion_stop()
+            self._wait_move_done(t_cmd)
             time.sleep(0.5)
 
             # Step 3: Y up until upper boundary > 20%
             set_status("Moving up...")
             for i in range(1, 101):
                 self._log(f"[GSP] Moving Y up (attempt {i})")
+                t_cmd = time.time()
                 move_actuator("up", 1200, y_speed, self._log)
-                self._wait_motion_stop()
+                self._wait_move_done(t_cmd, 1.2)
                 time.sleep(0.5)
                 pct = self._boundary_pct(UPPER_BOUNDARY_THRESHOLD)
                 if pct is not None:
@@ -2165,8 +2315,9 @@ class MotorControlApp(tk.Tk):
             # Step 4: one Y step back down
             set_status("Moving down...")
             self._log("[GSP] Step 4: Moving Y down one time")
+            t_cmd = time.time()
             move_actuator("down", 1500, y_speed, self._log)
-            self._wait_motion_stop()
+            self._wait_move_done(t_cmd, 1.5)
             time.sleep(0.5)
 
             self._log("[GSP] ✓ Starting point reached!")
@@ -2175,7 +2326,7 @@ class MotorControlApp(tk.Tk):
             self._log(f"[GSP] Error: {e}")
             set_status(f"Error: {e}")
         finally:
-            self._post( lambda: self.btn_go_start.configure(
+            self._post(lambda: self.btn_go_start.configure(
                 state="normal", text="↖ Go to Starting Point"))
 
     # ── Camera Feed ───────────────────────────────────────────────────────────
@@ -2239,7 +2390,7 @@ class MotorControlApp(tk.Tk):
             if auto_ms > 0 and (now - last_auto_time) * 1000 >= auto_ms:
                 with self._frame_lock:
                     self._frame_a_bgr = frame.copy()
-                self._post( lambda ms=auto_ms: self._frame_a_status.set(
+                self._post(lambda ms=auto_ms: self._frame_a_status.set(
                     f" Frame A: Auto ({ms}ms)"))
                 last_auto_time = now
 
@@ -2252,6 +2403,7 @@ class MotorControlApp(tk.Tk):
             display = frame.copy()
             boundaries = detect_boundaries(display)
             draw_boundaries(display, boundaries)
+            draw_focus_roi(display, FOCUS_CONFIG.get("roi"))
 
             if frame_a is not None:
                 prob = predict_focus_change(frame_a, frame)
@@ -2278,6 +2430,31 @@ class MotorControlApp(tk.Tk):
         """Thread-safe copy of the latest raw frame, or None."""
         with self._frame_lock:
             return self._latest_frame_raw.copy() if self._latest_frame_raw is not None else None
+
+    def _wait_move_done(self, t_cmd: float, expected_s: float = 0.0,
+                        start_timeout: float = 0.8, timeout_s: float = 10.0) -> bool:
+        """Wait until a commanded move has actually happened *and* stopped.
+
+        ``_wait_motion_stop`` alone returns at once if the detector is still
+        "still" from before the move - i.e. before the actuator has even
+        started.  The recorded scans show exactly that: each autofocus frame
+        sits ~265 px further along the Y move than the frame saved just before
+        it, ``Ycor_up`` frames continue ~210 px in the *previous* direction, and
+        Y-move frames carry 10-17 % less vertical detail than the (still) AF
+        frames - they were grabbed mid-move, motion-blurred.
+
+        So: wait out the commanded duration (whether or not the HTTP call
+        blocked), give the detector a moment to *see* motion if it has not yet,
+        then wait for stillness.
+        """
+        remaining = expected_s - (time.time() - t_cmd)
+        if remaining > 0:
+            time.sleep(remaining)
+        t0 = time.time()
+        while (not self._motion_detector.motion_since(t_cmd)
+               and time.time() - t0 < start_timeout):
+            time.sleep(0.03)
+        return self._wait_motion_stop(timeout_s)
 
     def _wait_motion_stop(self, timeout_s: float = 10.0) -> bool:
         """Block until the motion detector reports stillness, or timeout."""
@@ -2356,7 +2533,7 @@ class MotorControlApp(tk.Tk):
 
         def _do():
             ok, resp = http_get(cmd, log_fn=self._log)
-            self._post( lambda: self._cmd_resp_var.set(f"→ {resp[:60]}"))
+            self._post(lambda: self._cmd_resp_var.set(f"→ {resp[:60]}"))
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -2436,7 +2613,7 @@ class MotorControlApp(tk.Tk):
         def _do_ping():
             self._log("[PING] Sending ping…")
             self._connected = ping_esp32(self._log)
-            self._post( self._update_connection_indicator)
+            self._post(self._update_connection_indicator)
         threading.Thread(target=_do_ping, daemon=True).start()
 
     def _apply_ip(self, event=None):
@@ -2453,7 +2630,8 @@ class MotorControlApp(tk.Tk):
             self.conn_dot.configure(fg=C["danger"])
             self.conn_label.configure(text="DISCONNECTED", fg=C["muted"])
         if hasattr(self, "_sb_conn_var"):
-            self._sb_conn_var.set("● ONLINE" if self._connected else "● OFFLINE")
+            self._sb_conn_var.set(
+                "● ONLINE" if self._connected else "● OFFLINE")
             self._sb_conn_label.configure(
                 fg=C["success"] if self._connected else C["danger"])
 

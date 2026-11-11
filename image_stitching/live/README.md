@@ -11,6 +11,80 @@ capture ──► quality gate ──► bounded registration ──► accept? 
   replay)      gross defocus     + NCC verification      new area      canvas (+QC mask)
 ```
 
+**Since Nov 2026 the live mosaic is a preview.** The deliverable is the
+**global stitch** (`global_stitch.py`), made from *every* saved frame after the
+sweep - see section 0. The sweep GUI runs it automatically; for an old scan:
+
+```bash
+python live/run_global.py ../main_code/blade_images/scan_20261105_200702
+```
+
+---
+
+## 0. Why the live mosaic looked like a patchwork - and the fix
+
+Measured on `main_code/blade_images/scan_20261105_200702` (156 frames).
+
+| Cause | Evidence | Fix |
+|---|---|---|
+| **Clipped lens corners** blended as image | 95th-percentile brightness over the whole scan is ~0 in the top-right/bottom-right corners: outside the image circle (r ≈ 1058 px) in *every* frame. Each frame painted two black wedges; the feather smeared them into dark rectangles. | `lens.py` estimates the image circle and the vignetting from the scan itself; clipped pixels get zero weight, vignetting is flattened (up to x1.5 at the edge). Also used to mask ORB features: the circle edge is a static feature that "matches" at zero shift in every pair. |
+| **Tile-shaped focus weights** | `tile_weight_map` gave each 320x270 px tile one weight with a tile/8 ramp, and gave *low-contrast* tiles weight 1.0 - but a blurred tile is low-contrast, so the most defocused part of a frame got the highest weight (1.0 vs 0.15) and won the overlap up to a few px from its edge. | Measured weight used everywhere; ramp widened to half a tile. The global stitcher uses a continuous per-pixel sharpness map instead. |
+| **Greedy blend**: 64 px feather, scalar gain, "fill only empty pixels" | Every frame edge is a visible step in brightness/sharpness. | Global: one frame per pixel (sharpest, then most central), smoothed seams (Potts MRF), global gain solve, multi-band blending. Live: 160 px feather + lens weight. |
+| **Plain NCC cannot detect a wrong registration** | A match deliberately shifted by 77 px still scores plain NCC 0.90 (median): vignetting and the slow brightness gradient dominate. Band-passed NCC: wrong ≤ 0.07 (p90), right 0.36-0.85 (median). | `Registration.ncc_hp`; candidates are ranked by it and gated at 0.15 (live and global). |
+| **Frames grabbed while the stage is still moving** | Every AF frame sits ~265 px further along the Y move than the frame saved just before it; `Ycor_up` frames continue ~210 px in the *previous* direction; Y-move frames have 10-17 % less vertical detail than AF frames (3 scans). `_wait_motion_stop()` returns at once when the detector has not yet *seen* the move start. | `main3._wait_move_done()`: wait out the commanded duration, wait for motion to be seen, then for stillness. **Needs a check on the machine.** |
+| **Frames thrown away** | The live run dropped 86 of 156 frames (70 "duplicates"), parked 4 disconnected bands and hit `canvas_full`. | Live: unregistered frames are dead-reckoned and flagged, never parked or dropped; the preview runs at `accum_scale` 0.5 (which now really halves the canvas - it did not before). Global: every frame is used. |
+
+### The global stitcher (`global_stitch.py`)
+
+1. **Order + move types** from `capture_log.csv` (written by the sweep) or the
+   file names. AF frames get the move that preceded them (`AF:Ydown` ...):
+   "AF after a Y-down" is a consistent displacement, while lumping all AF
+   frames together gave a 560 px spread.
+2. **Registration**: consecutive pairs (unbounded, then bounded by the learned
+   move model), i→i+2 links, *bridges* over AF frames, a blur-tolerant
+   band-passed template matcher for frames ORB cannot match, and two rounds of
+   loop closures between any frames predicted to overlap (the down and up
+   strips overlap ~80 % horizontally).
+3. **Pose graph**: rotation + scale solved first (AF frames come back rotated
+   up to ~1°), then translations; robust (Cauchy) least squares with late
+   outlier rejection. Every consecutive pair also has a soft motion-model link,
+   so a frame with no image link is still placed (and shown red in
+   `_sources.png`).
+4. **Composite**: per-pixel score = lens validity × centrality × (sharpness
+   relative to the sharpest view of that spot)³ × **multi-view consensus**.
+   The consensus term matters on this blade: the right side curves away, and a
+   frame taken at another Z or from another strip maps that bland, curved part
+   differently than any rigid model predicts (measured: 86 px at the right edge
+   of an AF frame whose left half registers to 1.6 px). Without it each such
+   frame painted its own copy of a cooling hole next to the true one.
+
+Results (every frame used, nothing dropped):
+
+| scan | frames | image links | placed by motion model only | time |
+|---|---|---|---|---|
+| `scan_20261105_200702` | 156 | 1083 | 4 (hopelessly blurred) | ~2.5 min |
+| `from_scratch/test_images` (old batch stitcher: crash after 16 min) | 207 | 1122 | 0 | 3.5 min |
+| `scan_20261030_200028` | 338 | 2423 | 0 | 6.3 min |
+
+Outputs (`<prefix>_...`): `mosaic.jpg/.png`, `coverage.png`, `sources.png`
+(which frame each pixel came from; seams white, motion-model-only frames red),
+`low_detail.png` (no frame resolved detail there: blurred or featureless),
+`poses.csv`, `report.txt` (learned motion model, residuals, flagged frames).
+
+Tests: `python live/tests/test_global.py` - a synthetic serpentine scan with
+open-loop steps, mid-move AF frames, clipped/vignetted optics and blurred
+frames; every frame must be placed within 4 px of the truth and the mosaic
+must match the true surface.
+
+Known limits:
+* Geometry is a similarity per frame. The curved, bland right part of a frame
+  is not rigid between views; consensus hides that, it does not model it.
+  Focusing on the left 40 % (`FOCUS_CONFIG["roi"]`) with overlapping strips is
+  what makes that part of each frame unnecessary.
+* Faint "ghost" copies of a hole can remain where only blurred views
+  disagree; `low_detail.png` marks such areas.
+* The overlap search is O(frames²); ~1-2 s per frame on 8 threads.
+
 ---
 
 ## 1. What the current flow actually costs (measured on this repo's data)
@@ -96,15 +170,12 @@ On a column change or a skipped frame, the pipeline retries against the nearest
 frames already placed (`fallback_anchors`) — a column boundary no longer
 becomes a separate mosaic.
 
-### F. Capture-side changes (recommended, not yet in `main3.py`)
-1. **Capture only when still.** The GUI already waits for the motion detector,
-   but `_get_frame()` returns whatever the feed thread last decoded — up to
-   ~80 ms stale, i.e. possibly a frame from *during* the move. Take a fresh
-   grab for the saved frame, or use the settle gate in `run_live.py --camera`.
-2. **Stop saving `*_AF_*` frames.** They are autofocus references taken while Z
-   is still settling; measured sharper-neighbour ratio 0.42–0.70 and they are
-   exact duplicates of the next frame in several cases. Keep them only if you
-   need an audit trail, in a separate folder.
+### F. Capture-side changes
+1. **Capture only when still** - done (`main3._wait_move_done`, see section 0):
+   the old wait could return before the move had even started.
+2. ~~Stop saving `*_AF_*` frames.~~ Keep them: given the timing bug they are
+   the frames taken where the stage really stopped, and the global stitcher
+   uses every frame.
 3. **Make the step overlap-aware.** The sweep moves a fixed actuator duration,
    which produces 5 %–62 % overlap depending on speed and load. Now that a
    shift can be measured in ~40 ms, move → measure → capture when
@@ -122,6 +193,10 @@ becomes a separate mosaic.
 ---
 
 ## 3. What to delete (and how)
+
+> **By default: nothing.** The GUI never deletes raw sweep frames, and the
+> global stitch uses all of them - a frame the live preview rejected is often
+> the only sharp view of some spot. The tools below are for auditing.
 
 Two tools, same criteria:
 

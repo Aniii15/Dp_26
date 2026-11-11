@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -64,7 +64,7 @@ import numpy as np
 __all__ = [
     "FocusConfig", "FocusError", "FocusResult", "FocusStack", "AutoFocus",
     "FocusTrend", "TileMetrics", "tile_bounds", "tile_metrics",
-    "compose_focus_stack", "tile_weight_map",
+    "compose_focus_stack", "tile_weight_map", "full_frame",
 ]
 
 
@@ -85,6 +85,19 @@ class FocusConfig:
     tiles_x: int = 6
     tiles_y: int = 4
     margin: float = 0.04             # ignore this fraction of each frame edge
+    roi: tuple = (0.0, 0.0, 1.0, 1.0)
+    """Part of the frame the *search* looks at, as fractions (x0, y0, x1, y1).
+
+    The tile grid is laid over this rectangle only, so every focus decision
+    (peak, area-in-focus, depth spread) is about that region.  On this rig the
+    blade curves away from the lens towards the right of the view: no single Z
+    makes the whole frame sharp, and the right side is covered again - by the
+    sharp left part of the *next* strip - one X step later.  Focusing on the
+    left ~40 % therefore gives a sharp band in every frame, which the global
+    stitcher then picks per pixel.  Use ``(0, 0, 0.4, 1)`` for that.
+
+    Stacking (``compose_focus_stack``) and stitch weights
+    (``tile_weight_map``) always use the whole frame regardless of this."""
     preblur: int = 3                 # kill single-pixel sensor noise (odd, 0=off)
     # A tile may only vote on focus if it has *texture*.  Judged against the best
     # tile in view (relative) with a small absolute floor, because a badly
@@ -174,12 +187,38 @@ def _to_gray(frame: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
-def tile_bounds(shape, cfg: FocusConfig) -> list[tuple[int, int, int, int]]:
-    """Tile rectangles ``(y0, y1, x0, x1)``, row-major, edges inset by margin."""
+def _roi_px(shape, cfg: FocusConfig) -> tuple[int, int, int, int]:
+    """ROI as pixel bounds ``(x0, y0, x1, y1)``, clamped and never empty."""
     h, w = shape[:2]
+    rx0, ry0, rx1, ry1 = (tuple(cfg.roi) + (0.0, 0.0, 1.0, 1.0))[:4]
+    rx0, rx1 = sorted((min(max(rx0, 0.0), 1.0), min(max(rx1, 0.0), 1.0)))
+    ry0, ry1 = sorted((min(max(ry0, 0.0), 1.0), min(max(ry1, 0.0), 1.0)))
+    x0, x1 = int(round(rx0 * w)), int(round(rx1 * w))
+    y0, y1 = int(round(ry0 * h)), int(round(ry1 * h))
+    if x1 - x0 < 8:
+        x0, x1 = 0, w
+    if y1 - y0 < 8:
+        y0, y1 = 0, h
+    return x0, y0, x1, y1
+
+
+def full_frame(cfg: FocusConfig) -> FocusConfig:
+    """The same config with the ROI reset to the whole frame."""
+    if tuple(cfg.roi) == (0.0, 0.0, 1.0, 1.0):
+        return cfg
+    return replace(cfg, roi=(0.0, 0.0, 1.0, 1.0))
+
+
+def tile_bounds(shape, cfg: FocusConfig) -> list[tuple[int, int, int, int]]:
+    """Tile rectangles ``(y0, y1, x0, x1)``, row-major, over the ROI.
+
+    The margin is only applied at *frame* edges (vignetting, sensor border),
+    not at ROI edges that lie inside the frame."""
+    h, w = shape[:2]
+    x0, y0, x1, y1 = _roi_px(shape, cfg)
     my, mx = int(h * cfg.margin), int(w * cfg.margin)
-    xs = np.linspace(mx, w - mx, cfg.tiles_x + 1).astype(int)
-    ys = np.linspace(my, h - my, cfg.tiles_y + 1).astype(int)
+    xs = np.linspace(max(x0, mx), min(x1, w - mx), cfg.tiles_x + 1).astype(int)
+    ys = np.linspace(max(y0, my), min(y1, h - my), cfg.tiles_y + 1).astype(int)
     return [(int(ys[j]), int(ys[j + 1]), int(xs[i]), int(xs[i + 1]))
             for j in range(cfg.tiles_y) for i in range(cfg.tiles_x)]
 
@@ -1188,7 +1227,7 @@ def compose_focus_stack(frames: list[np.ndarray], cfg: FocusConfig | None = None
     (0..1) that the composite is sharp there - feed it to the stitcher so
     overlapping frames blend in favour of the sharpest evidence.
     """
-    cfg = cfg or FocusConfig()
+    cfg = full_frame(cfg or FocusConfig())
     if not frames:
         raise FocusError("compose_focus_stack needs at least one frame")
     if len(frames) == 1:
@@ -1241,15 +1280,22 @@ def tile_weight_map(frame: np.ndarray, cfg: FocusConfig | None = None,
     near ``floor``, so in an overlap the sharp neighbour wins the pixel - which
     is how a defocused band gets overwritten instead of embedded.
     """
-    cfg = cfg or FocusConfig()
+    cfg = full_frame(cfg or FocusConfig())
     m = tile_metrics(frame, cfg)
     best = float(np.percentile(m.sharpness, 90)) if m.sharpness.size else 0.0
     new_ref = max(reference or 0.0, best)
     if new_ref <= 0:
         return np.ones(frame.shape[:2], np.float32), 0.0
-    usable = m.contrast >= cfg.min_contrast
     rel = np.clip(m.sharpness / new_ref, 0.0, 1.0)
-    rel = np.where(usable, rel, 1.0)             # no texture: neutral, not penalised
+    # Low-contrast tiles used to get weight 1.0 ("no texture: neutral").  But a
+    # *blurred* textured tile also has low contrast, so the most defocused part
+    # of a frame got the highest weight and beat the sharp neighbour in the
+    # overlap - one source of the blocky patches.  Weights only matter relative
+    # to other frames at the same spot, where a featureless surface scores low
+    # in every frame anyway, so the measured value is used as-is.
     wt = np.clip(floor + (1.0 - floor) * rel ** 2, floor, 1.0)
-    return (_tile_weights_to_pixels(wt, frame.shape, cfg, 1.0)
+    # Smooth transitions (~half a tile).  A tile/8 ramp turned each 320x270 px
+    # tile into a visible rectangle in the blend.  (Focus *stacking* keeps the
+    # tight ramp on purpose - see compose_focus_stack.)
+    return (_tile_weights_to_pixels(wt, frame.shape, cfg, 4.0)
             .astype(np.float32)), new_ref

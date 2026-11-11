@@ -24,6 +24,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from .lens import default_lens
+
 GROW_MARGIN = 256
 
 
@@ -45,6 +47,17 @@ class IncrementalMosaic:
         self._lowq: np.ndarray | None = None     # pixels blended from soft frames
         self._placed = 0
         self._disconnected = 0
+        self._lens_cache: dict = {}
+
+    def _lens_valid(self, shape) -> np.ndarray | None:
+        """Lens validity map for a frame of this (already scaled) shape."""
+        frac = getattr(self.cfg, "lens_radius_frac", 0.0)
+        if not frac:
+            return None
+        key = tuple(shape[:2])
+        if key not in self._lens_cache:
+            self._lens_cache[key] = default_lens(key[0], key[1], frac).valid
+        return self._lens_cache[key]
 
     # ── canvas bookkeeping ──────────────────────────────────────────────────
     @property
@@ -55,8 +68,8 @@ class IncrementalMosaic:
     def disconnected(self) -> int:
         return self._disconnected
 
-    def bbox(self) -> tuple[int, int, int, int] | None:
-        """Content bounding box in mosaic coordinates."""
+    def _canvas_bbox(self) -> tuple[int, int, int, int] | None:
+        """Content bounding box as canvas-array slices (x0, y0, x1, y1)."""
         if self._wsum is None:
             return None
         covered = self._wsum > 0
@@ -64,8 +77,17 @@ class IncrementalMosaic:
             return None
         cols = np.where(covered.any(axis=0))[0]
         rows = np.where(covered.any(axis=1))[0]
-        return (int(cols[0] + self._origin[0]), int(rows[0] + self._origin[1]),
-                int(cols[-1] + 1 + self._origin[0]), int(rows[-1] + 1 + self._origin[1]))
+        return int(cols[0]), int(rows[0]), int(cols[-1] + 1), int(rows[-1] + 1)
+
+    def bbox(self) -> tuple[int, int, int, int] | None:
+        """Content bounding box in (full-resolution) mosaic coordinates."""
+        b = self._canvas_bbox()
+        if b is None:
+            return None
+        k = 1.0 / self.cfg.accum_scale          # canvas px -> mosaic px
+        ox, oy = self._origin
+        return (int(round((b[0] + ox) * k)), int(round((b[1] + oy) * k)),
+                int(round((b[2] + ox) * k)), int(round((b[3] + oy) * k)))
 
     def _ensure(self, x0: float, y0: float, x1: float, y1: float) -> None:
         """Grow the canvas so that mosaic-space box (x0,y0,x1,y1) fits."""
@@ -133,12 +155,18 @@ class IncrementalMosaic:
         return (slice(cy0, cy1), slice(cx0, cx1)), (cx1 - cx0, cy1 - cy0), m
 
     def _warp(self, frame: np.ndarray, m: np.ndarray, size: tuple[int, int]):
+        """Warp a frame; also returns its validity mask and lens weight."""
         w, h = size
         img = cv2.warpAffine(frame, m, (w, h), flags=cv2.INTER_LINEAR,
                              borderMode=cv2.BORDER_CONSTANT)
-        mask = cv2.warpAffine(np.ones(frame.shape[:2], np.uint8), m, (w, h),
-                              flags=cv2.INTER_NEAREST) > 0
-        return img, mask
+        valid = self._lens_valid(frame.shape)
+        if valid is None:
+            mask = cv2.warpAffine(np.ones(frame.shape[:2], np.uint8), m, (w, h),
+                                  flags=cv2.INTER_NEAREST) > 0
+            return img, mask, None
+        lw = cv2.warpAffine(valid, m, (w, h), flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT)
+        return img, lw > 0.05, lw
 
     # ── blending ────────────────────────────────────────────────────────────
     def _warp_weight(self, weight: np.ndarray, frame_shape: tuple[int, int],
@@ -183,13 +211,19 @@ class IncrementalMosaic:
         return float(np.clip(np.median(o[ok] / n[ok]), lo, hi))
 
     def _scaled(self, frame: np.ndarray, to_mosaic: np.ndarray):
-        """Apply ``accum_scale`` to a frame and its pose."""
+        """Apply ``accum_scale`` to a frame and its pose.
+
+        The canvas lives in *scaled* units (that is the whole point: 0.5 means
+        a quarter of the memory).  The old version scaled the frame down but
+        kept mapping it into full-resolution canvas units, so the canvas never
+        got smaller and the frame was merely blurred."""
         s = self.cfg.accum_scale
         if s == 1.0:
             return frame, to_mosaic
         small = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        S = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], float)
         inv = np.array([[1 / s, 0, 0], [0, 1 / s, 0], [0, 0, 1]], float)
-        return small, to_mosaic @ inv
+        return small, S @ to_mosaic @ inv
 
     def add(self, frame: np.ndarray, to_mosaic: np.ndarray,
             empty_only: bool = False, low_quality: bool = False,
@@ -207,7 +241,7 @@ class IncrementalMosaic:
         """
         frame, to_mosaic = self._scaled(frame, to_mosaic)
         roi, size, m = self._roi(frame.shape, to_mosaic)
-        warped, mask = self._warp(frame, m, size)
+        warped, mask, w_lens = self._warp(frame, m, size)
         w_frame = None
         if weight is not None:
             w_frame = self._warp_weight(weight, frame.shape[:2], m, size, mask)
@@ -220,6 +254,8 @@ class IncrementalMosaic:
             if not mask.any():
                 return AddResult(0.0, gain, self._wsum.shape)
         w = self._weight(mask)
+        if w_lens is not None:
+            w = w * w_lens
         if w_frame is not None:
             w = w * w_frame
         if gain != 1.0:
@@ -241,8 +277,9 @@ class IncrementalMosaic:
         """
         if self._wsum is None:
             return 1.0
+        frame, to_mosaic = self._scaled(frame, to_mosaic)
         roi, size, m = self._roi(frame.shape, to_mosaic)
-        _, mask = self._warp(frame, m, size)
+        _, mask, _ = self._warp(frame, m, size)
         total = float(mask.sum())
         if total <= 0:
             return 0.0
@@ -267,9 +304,8 @@ class IncrementalMosaic:
         out = np.zeros(self._acc.shape, np.uint8)
         out[valid] = np.clip(self._acc[valid] / self._wsum[valid, None],
                              0, 255).astype(np.uint8)
-        x0, y0, x1, y1 = self.bbox()
-        cx, cy = int(round(self._origin[0])), int(round(self._origin[1]))
-        sl = (slice(y0 - cy, y1 - cy), slice(x0 - cx, x1 - cx))
+        x0, y0, x1, y1 = self._canvas_bbox()
+        sl = (slice(y0, y1), slice(x0, x1))
         mosaic, coverage = out[sl], (valid[sl] * 255).astype(np.uint8)
         lowq = self._lowq[sl]
         s = self.cfg.output_scale

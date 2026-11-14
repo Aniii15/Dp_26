@@ -755,7 +755,7 @@ def build(dpi: int, out: str) -> str:
     c.text(X0 + 6.0, cy0 + 5.0, "GROUP 62", c.font("head", 4.6), AMBER,
            spacing=0.6)
     c.text(X0 + 6.0, cy0 + 10.6,
-           "Abhigit Gope · Ritik Gupta · Juhi Agrawal\nNitu Chaudhary · Anirudh "
+           "Abhijit Gope · Ritik Gupta · Juhi Agrawal\nNitu Chaudhary · Anirudh "
            "Berwal", c.font("body", 3.9), WHITE)
 
     s1 = X0 + 138.0

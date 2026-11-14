@@ -9,3 +9,5 @@ image_stitching/**/_rejected/
 image_stitching/**/purge_report.csv
 *.pyc
 
+poster/assets/_[a-z]*.png
+poster/assets/mosaic_*.png

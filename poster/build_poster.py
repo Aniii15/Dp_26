@@ -153,6 +153,15 @@ def load_cover(path: str, w_px: int, h_px: int, focus_y=0.35) -> Image.Image:
     return im.resize((w_px, h_px), Image.LANCZOS)
 
 
+def load_fit(path: str, w_px: int, h_px: int) -> tuple[Image.Image, int]:
+    """Scale to fit *inside* the box, never crop.  Returns (image, y offset)."""
+    im = Image.open(path).convert("RGB")
+    sw, sh = im.size
+    k = min(w_px / sw, h_px / sh)
+    nw, nh = max(1, int(sw * k)), max(1, int(sh * k))
+    return im.resize((nw, nh), Image.LANCZOS), (h_px - nh) // 2
+
+
 def rounded_mask(size, radius):
     m = Image.new("L", size, 0)
     ImageDraw.Draw(m).rounded_rectangle([0, 0, size[0] - 1, size[1] - 1],
@@ -208,20 +217,28 @@ def build(dpi: int, out: str) -> str:
         xx += 6.0
 
     # ══ MASTHEAD ════════════════════════════════════════════════════════════
-    BAND = 138.0
-    hero_w = 152.0
+    BAND = 150.0
+    # The hero keeps its full height: the blade is 768x1376 (0.56 aspect), so a
+    # ~84 mm wide plate at 150 mm tall fits it almost exactly instead of
+    # cropping the tip or the stage.  Everything else gets the space back.
+    hero_w = 84.0
     hero_x = X1 - hero_w
-    hero = load_cover(os.path.join(ASSETS, "blade_hero.png"),
-                      c.px(hero_w), c.px(BAND), focus_y=0.0)
-    hero = fade(hero, "up", NAVY, 205)
-    hx, hw, hh = c.px(hero_x), hero.size[0], hero.size[1]
+    hero, oy = load_fit(os.path.join(ASSETS, "blade_hero.png"),
+                        c.px(hero_w), c.px(BAND))
+    hero = fade(hero, "up", NAVY, 120)
+    d.rounded_rectangle([c.px(hero_x) - 1, 0, c.px(hero_x + hero_w),
+                         c.px(BAND)], radius=c.px(1.5), fill=(12, 26, 42),
+                         outline=BORDER, width=1)
+    hw, hh = hero.size
+    hero_rgba = hero.convert("RGBA")
     veil = Image.new("RGBA", (hw, hh), (0, 0, 0, 0))
     vd = ImageDraw.Draw(veil)
     for i in range(hw):
-        a = int(210 * (1 - i / hw) ** 1.5)
+        a = int(150 * (1 - i / hw) ** 1.6)
         vd.line([(i, 0), (i, hh)], fill=NAVY + (a,))
-    hero_rgba = Image.alpha_composite(hero.convert("RGBA"), veil).convert("RGB")
-    c.img.paste(hero_rgba, (hx, 0), rounded_mask(hero_rgba.size, c.px(1.5)))
+    hero_rgba = Image.alpha_composite(hero_rgba, veil).convert("RGB")
+    c.img.paste(hero_rgba, (c.px(hero_x) + (c.px(hero_w) - hw) // 2, oy),
+                rounded_mask(hero_rgba.size, c.px(1.2)))
 
     # ── institute mark, on a white plate (the logo is a white-ground original)
     LW, LH = 56.0, 30.0
@@ -237,24 +254,34 @@ def build(dpi: int, out: str) -> str:
     c.img.paste(logo, (c.px(X0 + (LW - lw / c.k) / 2),
                        c.px(9 + (LH - lh / c.k) / 2) + 3))
 
-    # ── institutional line, to the right of the mark
     kx = X0 + LW + 6.0
     c.text(kx, 11.0, "INDIAN INSTITUTE OF TECHNOLOGY MANDI", c.font("head", 4.4),
            CYAN, spacing=0.45)
     c.text(kx, 16.6, "Group 62  ·  Precision. Detection. Reliability.",
            c.font("body", 3.9), MUTED)
 
-    title_f = c.font("display", 27)
-    c.text(X0, 41.0, "BLADEVISION", title_f, WHITE, spacing=-0.3)
-    tw = d.textlength("BLADEVISION", font=title_f) / c.k
-    c.text(X0 + tw + 3.0, 40.3, "3.0", c.font("display", 27), CYAN,
-           spacing=-0.3)
+    # ── title, sized to the space that is actually free
+    gap_r = hero_x - 8.0
+    title_src = "BLADEVISION"
+    size = 30.0
+    while size > 16.0:
+        f = c.font("display", size)
+        t = d.textlength(title_src, font=f) / c.k
+        t2 = d.textlength("3.0", font=c.font("display", size * 0.62)) / c.k
+        if X0 + t + 4.0 + t2 <= gap_r:
+            break
+        size -= 0.4
+    title_f = c.font("display", size)
+    c.text(X0, 40.0, title_src, title_f, WHITE, spacing=-0.3)
+    tw = d.textlength(title_src, font=title_f) / c.k
+    c.text(X0 + tw + 4.0, 40.0 + size * 0.34, "3.0",
+           c.font("display", size * 0.62), CYAN, spacing=-0.3)
 
-    d.line([(c.px(X0), c.px(72)), (c.px(X0 + 86), c.px(72))], fill=CYAN,
+    d.line([(c.px(X0), c.px(76)), (c.px(X0 + 86), c.px(76))], fill=CYAN,
            width=max(2, c.px(0.5)))
-    c.text(X0, 77.0, "From a stepper pulse to a stitched mosaic.",
-           c.font("semibold", 8.2), WHITE)
-    c.para(X0, 88.0, 228.0,
+    c.text(X0, 81.0, "From a stepper pulse to a stitched mosaic.",
+           c.font("semibold", 8.4), WHITE)
+    c.para(X0, 92.0, min(226.0, gap_r - X0),
            "A closed-loop, boundary-guided scanner that photographs a turbine "
            "blade at full coverage and rebuilds it as one continuous, "
            "defect-ready image — with no position sensor on any axis.",
@@ -265,17 +292,9 @@ def build(dpi: int, out: str) -> str:
             ("68 %", "measured frame\noverlap (target 65)"),
             ("43 %", "of the captures\nof the old fixed steps"),
             ("13.3 k", "lines of Python\nacross 14 modules")]):
-        sx = X0 + i * 55.0
-        c.text(sx, 108.5, big, c.font("display", 10.6), CYAN)
-        c.text(sx, 120.5, small, c.font("body", 3.7), MUTED)
-
-    bw = 40.0
-    d.rounded_rectangle([c.px(X1 - bw), c.px(8), c.px(X1), c.px(21)],
-                        radius=c.px(1.5), fill=(18, 25, 31), outline=AMBER,
-                        width=max(1, c.px(0.25)))
-    c.text(X1 - bw / 2, 10.4, "GROUP", c.font("head", 3.3), AMBER, anchor="ma",
-           spacing=0.6)
-    c.text(X1 - bw / 2, 13.2, "62", c.font("display", 6.2), WHITE, anchor="ma")
+        sx = X0 + i * 56.0
+        c.text(sx, 114.0, big, c.font("display", 10.8), CYAN)
+        c.text(sx, 126.0, small, c.font("body", 3.7), MUTED)
 
     # ══ SPEC BAR ════════════════════════════════════════════════════════════
     spec_y = BAND + 3.0
@@ -523,16 +542,13 @@ def build(dpi: int, out: str) -> str:
     x, y = cx[2], TOP
     ty = card(x, y, col_w, "06 — THE RESULT", "One image, not a collage")
     p = ty + 3.2
-    IMG_H = 52.0
-    macro = load_cover(os.path.join(ASSETS, "surface_macro.png"),
+    IMG_H = 50.0
+    macro = load_cover(os.path.join(ASSETS, "real_detail.png"),
                        c.px(col_w - 2 * tx), c.px(IMG_H), focus_y=0.5)
     mx, my = x + tx, p
     c.img.paste(macro, (c.px(mx), c.px(my)),
                 rounded_mask(macro.size, c.px(1.4)))
-    ring_x, ring_y = mx + 46.0, my + 12.6
-    d.ellipse([c.px(ring_x - 3.4), c.px(ring_y - 3.4), c.px(ring_x + 3.4),
-               c.px(ring_y + 3.4)], outline=AMBER, width=max(2, c.px(0.34)))
-    cap = "film-cooling hole row  ·  1 : 1 mosaic tile"
+    cap = "real scan · 1 : 1 pixels · cooling-hole row"
     cap_w = d.textlength(cap, font=c.font("mono", 2.7)) / c.k + 3.2
     d.rounded_rectangle([c.px(mx + 1.2), c.px(my + 1.4),
                          c.px(mx + 1.2 + cap_w), c.px(my + 6.6)],
@@ -586,20 +602,21 @@ def build(dpi: int, out: str) -> str:
     # ══ SERPENTINE (full width) ═════════════════════════════════════════════
     # the band sits in the space that is left, a little closer to the credits
     # than to the columns above it
-    by = col_bottom + GAP + 12.0
-    ty = card(X0, by, CW, "09 — HOW A COLUMN RUNS",
+    by = col_bottom + GAP + 4.0
+    serp_w = CW * 0.565
+    ty = card(X0, by, serp_w, "09 — HOW A COLUMN RUNS",
               "Serpentine, boundary-triggered", pad=5.4)
     p = ty + 2.4
-    DH = 54.0
-    patch = Image.new("RGB", (c.px(CW) * S, int(DH * c.k) * S), PANEL2)
+    DH = 62.0
+    patch = Image.new("RGB", (c.px(serp_w) * S, int(DH * c.k) * S), PANEL2)
     pd = ImageDraw.Draw(patch)
 
     def Q(a, b):
         return (a * c.k * S, b * c.k * S)
 
-    ncol, nrow = 7, 5
-    cwid, chei = 30.0, 6.2
-    ox, oy = 19.0, 4.0
+    ncol, nrow = 5, 4
+    cwid, chei = 28.0, 8.6
+    ox, oy = 17.0, 4.6
     for ci in range(ncol):
         for ri in range(nrow):
             x0 = ox + ci * cwid
@@ -611,11 +628,10 @@ def build(dpi: int, out: str) -> str:
                                  radius=1.6 * S, fill=fill,
                                  outline=(40, 84, 118), width=S)
         label = (f"column {ci + 1}" if ci < 3 else
-                 ("…" if ci == 3 else ("last column" if ci == 6 else "")))
+                 ("…" if ci == 3 else "last column"))
         pd.text(Q(ox + ci * cwid + cwid / 2, oy + nrow * chei + 1.6), label,
                 font=dfont("head", 3.1),
                 fill=CYAN if ci < 3 else MUTED, anchor="ma")
-
 
     path = []
     for ci in range(ncol):
@@ -637,6 +653,7 @@ def build(dpi: int, out: str) -> str:
                        tip[1] - 1.5 * math.sin(ang + sgn * 0.55)), Q(*tip)],
                     fill=CYAN, width=int(1.3 * S))
 
+    # Y step bracket, on the left
     yb = oy + 2.5 * chei
     pd.line([Q(ox - 4.4, yb - chei / 2), Q(ox - 4.4, yb + chei / 2)],
             fill=AMBER, width=int(1.4 * S))
@@ -646,55 +663,90 @@ def build(dpi: int, out: str) -> str:
         pd.line([Q(ox - 4.4 + sgn * 1.5, yb + chei / 2 - 1.2),
                  Q(ox - 4.4, yb + chei / 2)], fill=AMBER, width=int(1.4 * S))
     pd.line([Q(ox - 4.4, yb), Q(ox - 1.2, yb)], fill=AMBER, width=S)
-    pd.line([Q(11.0, yb), Q(ox - 5.0, yb)], fill=(60, 62, 40), width=S)
-    pd.text(Q(1.4, yb - 2.6), "Y step", font=dfont("head", 3.0), fill=AMBER,
+    pd.line([Q(11.4, yb), Q(ox - 5.0, yb)], fill=(60, 62, 40), width=S)
+    pd.text(Q(1.2, yb - 2.7), "Y step", font=dfont("head", 3.0), fill=AMBER,
             anchor="lm")
-    pd.text(Q(1.4, yb + 0.4), "344 px", font=dfont("mono", 3.0), fill=WHITE,
+    pd.text(Q(1.2, yb + 0.3), "344 px", font=dfont("mono", 3.0), fill=WHITE,
             anchor="lm")
 
-    ybase = oy + nrow * chei - 7.4
+    # X step bracket between column 1 and 2
+    ybase = oy + nrow * chei - 7.2
     pd.line([Q(ox + cwid, ybase), Q(ox + cwid, ybase + 3.0)], fill=AMBER, width=S)
     pd.line([Q(ox + cwid, ybase + 1.5), Q(ox + 2 * cwid, ybase + 1.5)],
             fill=AMBER, width=S)
     pd.line([Q(ox + 2 * cwid, ybase), Q(ox + 2 * cwid, ybase + 3.0)],
             fill=AMBER, width=S)
     pd.text(Q(ox + 1.5 * cwid, ybase + 4.2), "X step 426 px  ->  0.90 mm",
-            font=dfont("head", 3.1), fill=AMBER, anchor="ma")
+            font=dfont("head", 3.0), fill=AMBER, anchor="ma")
 
+    # legend: one block on the right, one lane under the grid
     ax = ox + ncol * cwid + 6.0
-    pd.line([Q(ax - 2.6, oy), Q(ax - 2.6, oy + nrow * chei)],
+    pd.line([Q(ax - 2.8, oy - 1.0), Q(ax - 2.8, oy + nrow * chei + 1.0)],
             fill=(34, 76, 108), width=S)
-    pd.text(Q(ax, oy - 0.6), "BOUNDARY TRIGGERS", font=dfont("head", 3.1),
+    pd.text(Q(ax, oy - 1.4), "BOUNDARY TRIGGERS", font=dfont("head", 3.1),
             fill=TEAL)
     for i, (k, pct, v) in enumerate([("lower", "10 %", "turns the column"),
                                      ("upper", "20 %", "must see the real edge"),
                                      ("right", "10 %", "scan complete")]):
-        yb2 = oy + 5.0 + i * 8.6
+        yb2 = oy + 3.4 + i * 8.0
         pd.text(Q(ax, yb2), k, font=dfont("semibold", 3.0), fill=WHITE)
-        pd.text(Q(ax + 11.0, yb2), pct, font=dfont("mono", 3.0), fill=AMBER)
-        pd.text(Q(ax, yb2 + 3.5), v, font=dfont("body", 2.8), fill=MUTED)
-    af_y = oy + nrow * chei + 9.0
-    pd.line([Q(ox - 4.4, af_y - 1.6), Q(ax - 2.6, af_y - 1.6)],
+        pd.text(Q(ax + 10.6, yb2), pct, font=dfont("mono", 3.0), fill=AMBER)
+        pd.text(Q(ax, yb2 + 3.3), v, font=dfont("body", 2.75), fill=MUTED)
+
+    af_y = oy + nrow * chei + 6.6
+    pd.line([Q(ox - 4.4, af_y - 1.6), Q(ox + ncol * cwid - 4.0, af_y - 1.6)],
             fill=(34, 76, 108), width=S)
     pd.text(Q(ox - 4.4, af_y + 0.6), "AUTOFOCUS", font=dfont("head", 3.1),
             fill=TEAL)
-    pd.text(Q(ox + 24.0, af_y + 0.6), "every 4th row, plus both sides of every "
-                                      "column turn", font=dfont("body", 2.9),
+    pd.text(Q(ox + 20.0, af_y + 0.6), "every 4th row, plus both sides of every "
+                                      "column turn", font=dfont("body", 2.85),
             fill=MUTED)
 
-    patch = patch.resize((c.px(CW), c.px(DH)), Image.LANCZOS)
+    patch = patch.resize((c.px(serp_w), c.px(DH)), Image.LANCZOS)
     c.img.paste(patch, (c.px(X0), c.px(p)))
     p += DH + 3.0
-    p = c.para(X0 + 5.4, p, CW - 10.8,
+    p = c.para(X0 + 5.4, p, serp_w - 10.8,
                "The sweep never counts rows. It walks until the boundary "
                "estimate says the edge is in view, turns a column, and walks "
                "back the other way — so a longer part simply takes more moves "
-               "rather than a re-parameterised job.", c.font("body", 4.0), BODY)
-    band_bottom = close(X0, by, CW, p + 1.0, "09 serpentine")
+               "rather than a re-parameterised job.", c.font("body", 3.9), BODY)
+    band1 = close(X0, by, serp_w, p + 1.0, "09 serpentine")
+
+    # ── the two real images, side by side: the mosaic and its source map ────
+    ix = X0 + serp_w + COLGAP
+    iw = CW - serp_w - COLGAP
+    ty = card(ix, by, iw, "10 — THE REAL OUTPUT",
+              "A full blade, and who owns each pixel", accent=TEAL, pad=5.0)
+    p = ty + 3.0
+    two_w = (iw - 3 * 4.4) / 2.0
+    ih = 57.0
+    for j, (path, cap_t, cap_s) in enumerate([
+            (os.path.join(ASSETS, "real_mosaic.jpg"), "stitched mosaic",
+             "5 680 × 12 697 px"),
+            (os.path.join(ASSETS, "real_sources.png"), "per-pixel source map",
+             "one colour per frame")]):
+        bxx = ix + 4.4 + j * (two_w + 4.4)
+        im, oy = load_fit(path, c.px(two_w), c.px(ih))
+        # a dark plate behind, so both images sit on the same ground
+        d.rounded_rectangle([c.px(bxx), c.px(p), c.px(bxx + two_w),
+                             c.px(p + ih)], radius=c.px(2), fill=(6, 12, 20),
+                            outline=BORDER, width=1)
+        c.img.paste(im, (c.px(bxx) + (c.px(two_w) - im.size[0]) // 2,
+                         c.px(p) + oy),
+                    rounded_mask(im.size, c.px(1.6)))
+        c.text(bxx, p + ih + 2.2, cap_t, c.font("semibold", 3.6), WHITE)
+        c.text(bxx, p + ih + 6.6, cap_s, c.font("mono", 2.9), MUTED)
+    p += ih + 13.0
+    p = c.para(ix + 5.0, p, iw - 10.0,
+               "Left: the deliverable, from every frame of one scan. Right: the "
+               "same scan with each pixel coloured by the frame that won it — "
+               "red = dead-reckoned, white = seams.", c.font("body", 3.75), BODY)
+    band2 = close(ix, by, iw, p, "10 real output")
+    band_bottom = max(band1, band2)
 
     # ══ CREDITS ═════════════════════════════════════════════════════════════
     cred_h = 32.0
-    cy0 = band_bottom + 12.0
+    cy0 = min(band_bottom + 8.0, H_MM - 10.0 - cred_h)
     d.rounded_rectangle([c.px(X0), c.px(cy0), c.px(X1), c.px(cy0 + cred_h)],
                         radius=c.px(3), fill=PANEL, outline=BORDER, width=1)
     d.rectangle([c.px(X0), c.px(cy0 + cred_h - 1.6), c.px(X1),

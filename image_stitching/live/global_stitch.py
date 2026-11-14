@@ -1253,4 +1253,9 @@ def stitch_folder(folder, out_prefix, cfg: GlobalConfig | None = None,
     st.write_reports(str(out_prefix), paths)
     paths["report"] = f"{out_prefix}_report.txt"
     paths["poses"] = f"{out_prefix}_poses.csv"
+    # The learned per-move motion models: the only measurement of how far the
+    # machine actually stepped on *this* rig, so callers can calibrate against
+    # it instead of a hardcoded pixel scale.
+    paths["motion"] = dict(getattr(st, "motion", {}) or {})
+    paths["frame_shape"] = tuple(st.shape) if st.shape else None
     return paths

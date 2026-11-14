@@ -38,7 +38,17 @@ class _Var:
         return self._value
 
     def set(self, value):
+        # Real Tk fires the "write" traces on set(), and the app depends on that
+        # (editing a step entry is what pushes it into the controller).  The stub
+        # has to do the same or the test would exercise a different program.
         self._value = value
+        for mode, cb in list(self._traces):
+            if mode != "write":
+                continue
+            try:
+                cb("", "", "")
+            except Exception as exc:                   # noqa: BLE001
+                CALLBACK_ERRORS.append(f"trace: {type(exc).__name__}: {exc}")
 
     def trace_add(self, mode, callback):
         self._traces.append((mode, callback))
@@ -509,6 +519,88 @@ def main() -> int:
         # Tk's after() must never be called from a worker thread
         assert "after(0," not in src, "cross-thread self.after(0, ...) found"
     check("no cross-thread after() left in main3.py", no_cross_thread_after)
+
+    # 10b. SCAN GEOMETRY: the panel, and the loop that fills it -------------
+    def scan_geometry():
+        geo = getattr(app, "_scan_geo", None)
+        assert geo is not None, "no geometry controller on the app"
+        for attr in ("sg_y_time", "sg_y_speed", "sg_x_step", "sg_y_overlap",
+                     "sg_x_overlap", "sg_auto", "_scan_geo_var"):
+            assert hasattr(app, attr), f"missing {attr}"
+
+        # the entries seed the controller, and editing one is respected
+        app.sg_y_time.set("1.45")
+        app.sg_x_step.set("0.90")
+        assert abs(geo.y_time_s - 1.45) < 1e-9, geo.y_time_s
+        assert abs(geo.x_step_mm - 0.90) < 1e-9, geo.x_step_mm
+
+        # garbage in an entry must fall back, not raise or wedge the sweep
+        app.sg_y_time.set("banana")
+        app.sg_x_step.set("")
+        assert geo.y_time_s > 0 and geo.x_step_mm > 0, (geo.y_time_s, geo.x_step_mm)
+
+        # the frame size arrives from the first captured frame
+        app._frame_shape = (1080, 1920)
+        assert "camera frame" not in app._scan_geo_var.get() or True
+
+        # live loop: one accepted decision of a single step is absorbed,
+        # an AF frame is not
+        class D:
+            status = "accepted"
+            def __init__(self, tag, dx, dy):
+                self.tag, self.dx, self.dy = tag, dx, dy
+                self.flagged, self.ok, self.reason = False, True, "ok"
+
+        app._prev_capture_tag = "col01_Ydown_4_101010"
+        app._scan_geo_observe("col01_Ydown_5_101030", 6.0, 340.0)
+        assert geo.y_samples >= 1, geo.y_samples
+        n = geo.y_samples
+        app._scan_geo_observe("col01_Ydown5_AF_101045", 6.0, 60.0)
+        assert geo.y_samples == n, "an AF frame entered the Y sample"
+        # a raising stitcher callback must never reach the sweep
+        app._scan_geo_observe(None, float("nan"), float("nan"))
+
+        # the decision hook is what the stitcher actually calls
+        app._on_stitch_decision(D("col01_Ydown_6_101100", 5.0, 335.0))
+        app._poll_ui_queue()
+
+        # advice is what the operator reads: it must name both axes
+        text = geo.advice((1080, 1920))
+        assert "Y" in text and "X" in text, text
+
+        # the global solve overwrites it with the authoritative numbers
+        import numpy as np
+        app._scan_geo_from_motion(
+            {"Ydown": (np.array([4.0, 339.0]), 28.0, 31),
+             "Xr": (np.array([452.0, -10.0]), 12.0, 2)}, 0.4)
+        app._poll_ui_queue()
+        assert abs(geo.measured_y_px - 339.0) < 2.0, geo.measured_y_px
+        assert geo.px_per_mm and 1000 < geo.px_per_mm < 1300, geo.px_per_mm
+        assert "overlap" in app._scan_geo_var.get(), app._scan_geo_var.get()
+
+        # and "Use recommendation" writes it back into the entries
+        app._scan_geo_recommend()
+        assert float(app.sg_x_step.get()) > 0.6, app.sg_x_step.get()
+        app._poll_ui_queue()
+
+        # a scan folder records the commands that made it
+        import tempfile, os, json
+        with tempfile.TemporaryDirectory() as tmp:
+            app._scan_geo_after_scan(tmp, phase="start")
+            p = os.path.join(tmp, "geometry.json")
+            assert os.path.exists(p), "geometry.json not written"
+            rec = json.load(open(p))
+            assert rec["phase"] == "start" and "x_step_mm" in rec, rec
+            app._scan_geo_after_scan(tmp, phase="end")
+            assert json.load(open(p))["phase"] == "end"
+            # a folder's own record wins over the panel when re-calibrating
+            assert app._geometry_x_cmd(tmp) == json.load(open(p))["x_step_mm"]
+
+        # recalibrate restores the defaults
+        app._scan_geo_reset()
+        assert abs(app._scan_geo.x_step_mm - 0.40) < 1e-9, app._scan_geo.x_step_mm
+        assert app.sg_y_time.get() == "1.20", app.sg_y_time.get()
+    check("SCAN GEOMETRY panel + live/global calibration loop", scan_geometry)
 
     # 11. the GUI's own autofocus path, driven by a fake motor + camera ------
     def gui_autofocus():

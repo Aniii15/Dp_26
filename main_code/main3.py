@@ -32,6 +32,11 @@ except ImportError:
     HAS_PIL = False
 
 try:
+    import scan_geometry as _scan_geometry
+except ImportError:            # optional: the sweep falls back to its constants
+    _scan_geometry = None
+
+try:
     import focus_engine as _focus_engine
 except ImportError:              # optional: only needed for region-wise AF
     _focus_engine = None
@@ -125,6 +130,12 @@ LIVE_STITCH_CONFIG = {
 # (image_stitching/live/global_stitch.py): every frame is used, poses are
 # solved over all overlaps at once, and the blend has no blocks.  Runs in the
 # background; the result replaces the live preview in the mosaic panel.
+# Where the learned sweep geometry (px/mm, achieved steps) is remembered between
+# runs.  A calibration is only valid for one rig + lens + resolution, so it is
+# re-learned from every scan and never shipped as a constant.
+GEOMETRY_CAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "blade_mosaic", "scan_geometry.json")
+
 GLOBAL_STITCH = True
 GLOBAL_STITCH_CONFIG = {
     "output_scale": 1.0,    # 0.5 for a quick look at very large parts
@@ -834,6 +845,17 @@ class MotorControlApp(tk.Tk):
         Note the callback fires while the stitcher holds its own lock, so this
         must stay cheap: queue the decision and return immediately.
         """
+        # Feed the measured step back into SCAN GEOMETRY first: this is the
+        # coarse, live loop that keeps the overlap right *during* the scan.
+        # ``_scan_geo_observe`` gates on single_step() so AF frames and dropped
+        # frames never enter the sample, and swallows every exception - a
+        # stitcher callback may never stop a sweep.
+        if getattr(decision, "status", None) == "accepted":
+            try:
+                d = decision
+                self._scan_geo_observe(d.tag, float(d.dx), float(d.dy))
+            except Exception:                 # noqa: BLE001
+                pass
         self._post(lambda: self._stitch_decision_ui(decision))
 
     def _stitch_decision_ui(self, decision):
@@ -1193,10 +1215,231 @@ class MotorControlApp(tk.Tk):
 
     # ── Tab: Sweep ────────────────────────────────────────────────────────────
 
+    # ── Scan geometry (how far the machine steps) ────────────────────────────
+
+    def _scan_geo_init(self):
+        """Load the last learned calibration, or start from the defaults."""
+        geo = None
+        if _scan_geometry is not None:
+            geo = _scan_geometry.ScanGeometry.load(GEOMETRY_CAL_PATH)
+        if geo is None and _scan_geometry is not None:
+            geo = _scan_geometry.ScanGeometry()
+        self._scan_geo = geo
+        self._frame_shape = None          # set from the first saved frame
+        self._last_x_cmd_mm = geo.x_step_mm if geo else 0.4
+        self._prev_capture_tag = None
+        self._last_sweep_scan_dir = None
+        return geo
+
+    def _build_scan_geometry_panel(self, parent):
+        """Step sizes for both axes - and what they actually achieve.
+
+        Neither axis reports its position, so the only honest way to choose a
+        step is to ask the camera: the stitcher measures the real pixel
+        displacement of the frames it registers.  Those measurements are shown
+        here, and (with Auto-tune on) fed back into the commands.
+        """
+        geo = self._scan_geo
+        box = self._card(parent, "SCAN GEOMETRY", C["accent2"],
+                         "how far the machine steps between frames, and the "
+                         "overlap that actually results")
+
+        def row(label, var, unit, width=7):
+            r = tk.Frame(box, bg=C["panel"])
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=label, bg=C["panel"], fg=C["muted"],
+                     font=FONT_SMALL, width=24, anchor="w").pack(side="left")
+            self._make_entry(r, var, w=width).pack(side="left")
+            tk.Label(r, text=unit, bg=C["panel"], fg=C["muted"],
+                     font=FONT_SMALL).pack(side="left", padx=4)
+
+        self.sg_y_time = tk.StringVar(value=f"{geo.y_time_s:.2f}" if geo else "1.20")
+        self.sg_y_speed = tk.StringVar(value=str(geo.y_speed) if geo else "70")
+        self.sg_x_step = tk.StringVar(value=f"{geo.x_step_mm:.2f}" if geo else "0.40")
+        self.sg_y_overlap = tk.StringVar(
+            value=f"{int(round(100 * geo.target_y_overlap))}" if geo else "65")
+        self.sg_x_overlap = tk.StringVar(
+            value=f"{int(round(100 * geo.target_x_overlap))}" if geo else "50")
+        self.sg_auto = tk.BooleanVar(value=bool(geo.auto_tune) if geo else True)
+
+        row("Y step (pulse time)", self.sg_y_time, "s   per Y move")
+        row("Y actuator PWM", self.sg_y_speed, "10-255")
+        row("X step", self.sg_x_step, "mm  per column")
+        row("Target Y overlap", self.sg_y_overlap, "% between frames")
+        row("Target X overlap", self.sg_x_overlap, "% between columns")
+
+        ctl = tk.Frame(box, bg=C["panel"])
+        ctl.pack(fill="x", pady=(4, 2))
+        self.sg_auto_chk = tk.Checkbutton(
+            ctl, text="Auto-tune from the measured step", variable=self.sg_auto,
+            command=self._scan_geo_sync, bg=C["panel"], fg=C["text"],
+            selectcolor=C["surface"], activebackground=C["panel"],
+            activeforeground=C["text"], font=FONT_SMALL)
+        self.sg_auto_chk.pack(side="left")
+        self._make_btn(ctl, "Use recommendation",
+                       self._scan_geo_recommend).pack(side="left", padx=6)
+        self._make_btn(ctl, "Recalibrate",
+                       self._scan_geo_reset).pack(side="left")
+
+        for v in (self.sg_y_time, self.sg_y_speed, self.sg_x_step,
+                  self.sg_y_overlap, self.sg_x_overlap):
+            v.trace_add("write", lambda *_: self._scan_geo_sync())
+
+        self._scan_geo_var = tk.StringVar(
+            value="no measurement yet - the pixel scale comes from the first "
+                  "column advance")
+        tk.Label(box, textvariable=self._scan_geo_var, bg=C["panel"],
+                 fg=C["text"], font=FONT_SMALL, anchor="w", justify="left",
+                 wraplength=780).pack(fill="x", pady=(4, 0))
+
+    def _scan_geo_sync(self):
+        """Push the entries into the controller (called on every edit)."""
+        geo = getattr(self, "_scan_geo", None)
+        if geo is None:
+            return
+
+        def num(var, default, lo=None, hi=None):
+            try:
+                v = float(var.get())
+            except (TypeError, ValueError, AttributeError):
+                return default
+            if lo is not None:
+                v = max(lo, v)
+            if hi is not None:
+                v = min(hi, v)
+            return v
+
+        geo.y_time_s = num(self.sg_y_time, geo.y_time_s, 0.15, 6.0)
+        geo.y_speed = int(num(self.sg_y_speed, geo.y_speed, 10, 255))
+        geo.x_step_mm = num(self.sg_x_step, geo.x_step_mm, 0.02, 20.0)
+        geo.target_y_overlap = num(self.sg_y_overlap,
+                                  100 * geo.target_y_overlap, 5.0, 90.0) / 100.0
+        geo.target_x_overlap = num(self.sg_x_overlap,
+                                  100 * geo.target_x_overlap, 5.0, 90.0) / 100.0
+        geo.auto_tune = bool(self.sg_auto.get())
+        self._scan_geo_refresh()
+
+    def _scan_geo_refresh(self):
+        geo = getattr(self, "_scan_geo", None)
+        if geo is None or not hasattr(self, "_scan_geo_var"):
+            return
+        self._scan_geo_var.set(geo.advice(self._frame_shape))
+
+    def _scan_geo_recommend(self):
+        """Adopt the measurement's recommendation (needs a measurement)."""
+        geo = getattr(self, "_scan_geo", None)
+        if geo is None or not self._frame_shape:
+            self._log("[SWEEP] geometry: no measurement yet, nothing to apply")
+            return
+        t = geo.suggested_y_time(self._frame_shape[0])
+        x = geo.suggested_x_step_mm(self._frame_shape[1])
+        if t is not None and hasattr(self, "sg_y_time"):
+            self.sg_y_time.set(f"{t:.2f}")
+        if x is not None and hasattr(self, "sg_x_step"):
+            self.sg_x_step.set(f"{x:.2f}")
+        self._log(f"[SWEEP] geometry recommendation applied: {geo.describe()}")
+        self._scan_geo_sync()
+
+    def _scan_geo_reset(self):
+        """Throw the calibration away and start from the defaults."""
+        if _scan_geometry is None:
+            return
+        self._scan_geo = _scan_geometry.ScanGeometry()
+        for var, val in ((self.sg_y_time, "1.20"), (self.sg_y_speed, "70"),
+                         (self.sg_x_step, "0.40"), (self.sg_y_overlap, "65"),
+                         (self.sg_x_overlap, "50")):
+            var.set(val)
+        self.sg_auto.set(True)
+        self._log("[SWEEP] geometry calibration cleared - defaults restored")
+        self._scan_geo_sync()
+
+    def _scan_geo_observe(self, tag: str, dx: float, dy: float):
+        """Record one measured step from the live stitcher (stitcher thread)."""
+        geo = getattr(self, "_scan_geo", None)
+        if geo is None or _scan_geometry is None or not self._frame_shape:
+            return
+        axis = _scan_geometry.single_step(getattr(self, "_prev_capture_tag", None),
+                                          tag)
+        self._prev_capture_tag = tag
+        if axis is None:
+            return
+        try:
+            geo.observe(axis, dx, dy, tuple(self._frame_shape),
+                        moved_mm=self._last_x_cmd_mm if axis == "X" else None)
+        except Exception:                 # noqa: BLE001 - never break a scan
+            pass
+
+    def _scan_geo_after_scan(self, images_dir: str, phase: str = "end") -> None:
+        """Record what this scan used, so its pixel scale is attributable.
+
+        Called twice: once when the scan starts (what it intended) and once when
+        it ends (what it actually used - auto-tune may have moved both steps).
+        Without the first one, a mid-scan correction would leave the early
+        columns unattributable, which is the exact ambiguity that made px/mm
+        look inconsistent between two scans of the same rig.
+        """
+        geo = getattr(self, "_scan_geo", None)
+        if geo is None or _scan_geometry is None or not images_dir:
+            return
+        if phase == "start":
+            self._scan_geo_baseline = geo.describe()
+        path = _scan_geometry.write_scan_geometry(
+            images_dir, geo,
+            extra={"phase": phase,
+                   "commands_at_start": getattr(self, "_scan_geo_baseline", None),
+                   "x_steps_per_mm": X_STEPS_PER_MM,
+                   "x_steps": mm_to_x_steps(geo.x_step_mm),
+                   "frame_hw": list(self._frame_shape) if self._frame_shape else None,
+                   "targets": {"y": geo.target_y_overlap, "x": geo.target_x_overlap}})
+        if path:
+            self._log(f"[SWEEP] geometry recorded: {os.path.basename(path)}")
+
+    def _geometry_x_cmd(self, images_dir: str) -> float | None:
+        """The X step a scan folder was captured with, in mm.
+
+        Re-stitching an old folder must calibrate against *that* folder's
+        commands, not against whatever the panel says now - a stale command
+        applied to a fresh measurement is how px/mm drifted by 37 % between two
+        scans of this rig.
+        """
+        if _scan_geometry is not None and images_dir:
+            try:
+                rec = _scan_geometry.read_scan_geometry(images_dir)
+            except Exception:                 # noqa: BLE001
+                rec = None
+            if rec is not None and rec.x_step_mm:
+                return float(rec.x_step_mm)
+        geo = getattr(self, "_scan_geo", None)
+        return geo.x_step_mm if geo else None
+
+    def _scan_geo_from_motion(self, motion: dict, x_cmd_mm: float | None) -> None:
+        """Calibrate from the global stitcher's learned motion models.
+
+        This is the authoritative measurement of a finished scan (every frame, a
+        globally consistent solve), so it is what the *next* scan should use.
+        """
+        geo = getattr(self, "_scan_geo", None)
+        if geo is None or _scan_geometry is None or not motion or not self._frame_shape:
+            return
+        got = geo.absorb_motion(motion, tuple(self._frame_shape), x_cmd_mm)
+        if not got:
+            return
+        self._log(f"[GLOBAL] geometry from the solve: {got}")
+        for line in _scan_geometry.geometry_lines(geo, motion,
+                                                  tuple(self._frame_shape),
+                                                  x_cmd_mm):
+            self._log(f"[GLOBAL] {line}" if line.strip() else "[GLOBAL]")
+        geo.save(GEOMETRY_CAL_PATH)
+        self._post(self._scan_geo_refresh)
+
     def _build_tab_sweep(self, parent):
+        self._scan_geo_init()
+        self._build_scan_geometry_panel(parent)
+
         box = self._card(parent, "AUTO SWEEP", C["warn"],
-                         "X: ±0.4 mm (1000 µs)   ·   Y: ±1.3 s (PWM 70)   ·   "
-                         "boundary trigger 10 %")
+                         "Boundary-guided serpentine sweep.  The step sizes live "
+                         "in SCAN GEOMETRY above; the overlap they produce is "
+                         "measured while the scan runs and corrected.")
 
         btn_row = tk.Frame(box, bg=C["panel"])
         btn_row.pack(fill="x", pady=(0, 6))
@@ -1850,6 +2093,11 @@ class MotorControlApp(tk.Tk):
             weight = self._focus_weight(frame) if frame is not None else None
         if frame is None:
             return
+        if self._frame_shape is None:
+            # The pixel scale needs the frame size, and the frame size is only
+            # known once a frame exists.  Taken before the first save so the
+            # very first measured step is already usable.
+            self._frame_shape = frame.shape[:2]
         filename = f"col{column:02d}_{phase}_{time.strftime('%H%M%S')}.jpg"
         try:
             if cv2.imwrite(os.path.join(images_dir, filename), frame,
@@ -1992,6 +2240,14 @@ class MotorControlApp(tk.Tk):
                                       GlobalConfig(**GLOBAL_STITCH_CONFIG),
                                       log=lambda m: self._log(m))
                 self._log(f"[GLOBAL] mosaic {paths.get('shape')} -> {paths.get('jpg')}")
+                # The global solve registered every frame against every
+                # neighbour, so its per-move motion models are the honest
+                # measurement of what this scan's commands did.  Persisted for
+                # the next scan (see SWEEP_GEOMETRY.md).
+                if paths.get("frame_shape") and self._frame_shape is None:
+                    self._frame_shape = tuple(paths["frame_shape"])
+                self._scan_geo_from_motion(paths.get("motion"),
+                                           self._geometry_x_cmd(images_dir))
                 self._show_mosaic_file(paths.get("jpg"))
             except Exception as exc:            # never take the GUI down
                 self._log(f"[GLOBAL] re-stitch failed: {exc}")
@@ -2048,6 +2304,10 @@ class MotorControlApp(tk.Tk):
         self.btn_stop_autosweep.configure(state="normal")
         self._autosweep_running = True
         self._autosweep_stop_evt.clear()
+        # Take the step sizes from the panel *here*, on the Tk thread: the
+        # worker must never touch a StringVar (that is a cross-thread Tk call).
+        self._scan_geo_sync()
+        self._prev_capture_tag = None
         threading.Thread(target=self._sweep_worker, daemon=True).start()
 
     def _sweep_worker(self):
@@ -2062,11 +2322,43 @@ class MotorControlApp(tk.Tk):
         start_time = time.time()
         self._autosweep_start_time = start_time
 
-        x_steps = mm_to_x_steps(0.4)
-        y_speed = 70
-        y_duration_ms = 1200
-        y_correction_ms = 1500
+        # Step sizes come from SCAN GEOMETRY, which is corrected from the
+        # *measured* pixel displacement of the frames the stitcher registers.
+        # Nothing here is hardcoded any more.
+        geo = getattr(self, "_scan_geo", None)
+        if geo is not None and not geo.frame_hw and self._frame_shape:
+            geo.frame_hw = tuple(self._frame_shape)
+        y_speed = geo.y_speed if geo else 70
+        x_steps = mm_to_x_steps(geo.x_step_mm if geo else 0.4)
         max_y_moves = 100
+        self._last_sweep_scan_dir = images_dir
+        self._log(f"[SWEEP] geometry: {geo.describe() if geo else 'defaults'}")
+        self._scan_geo_after_scan(images_dir, phase="start")
+
+        def y_ms() -> int:
+            """Current Y pulse width.
+
+            Read per move rather than captured once, so a correction derived
+            from frames already stitched takes effect in the same column.
+            """
+            return int(round(1000 * (geo.y_time_s if geo else 1.2)))
+
+        def y_corr_ms() -> int:
+            return int(round(1250 * (geo.y_time_s if geo else 1.2)))
+
+        def tune():
+            """Adopt measured corrections.  Never raises, never stops a scan."""
+            if geo is None or not self._frame_shape:
+                return
+            try:
+                changes = geo.apply(tuple(self._frame_shape))
+            except Exception:                 # noqa: BLE001
+                return
+            for k, (old, new) in changes.items():
+                self._log(f"[SWEEP] auto-tune {k}: {old} -> {new}  "
+                          f"({geo.advice(self._frame_shape)})")
+            if changes:
+                self._post(self._scan_geo_refresh)
         LOWER_PCT = 10.0    # lower-boundary trigger
         UPPER_PCT = 20.0    # upper-boundary trigger
         RIGHT_PCT = 10.0    # right-boundary trigger → scan done
@@ -2128,13 +2420,14 @@ class MotorControlApp(tk.Tk):
                     return False
                 self._log(f"[SWEEP] Moving Y {direction} (attempt {i})")
                 t_cmd = time.time()
-                move_actuator(direction, y_duration_ms, y_speed, self._log)
-                self._wait_move_done(t_cmd, y_duration_ms / 1000.0)
+                move_actuator(direction, y_ms(), y_speed, self._log)
+                self._wait_move_done(t_cmd, y_ms() / 1000.0)
                 time.sleep(0.5)
                 save(f"{prefix}_{i}")
                 if i % 4 == 0:
                     self._log("[SWEEP] Running AutoFocus after 4 Y moves")
                     autofocus_y(f"{prefix}{i}_AF")
+                    tune()
                 pct = self._boundary_pct(detect_thr)
                 if pct is not None:
                     self._log(
@@ -2150,16 +2443,22 @@ class MotorControlApp(tk.Tk):
 
         def y_correct(direction, tag):
             self._log(
-                f"[SWEEP] Corrective Y {direction} shift ({y_correction_ms}ms)")
+                f"[SWEEP] Corrective Y {direction} shift ({y_corr_ms()}ms)")
             t_cmd = time.time()
-            move_actuator(direction, y_correction_ms, y_speed, self._log)
-            self._wait_move_done(t_cmd, y_correction_ms / 1000.0)
+            move_actuator(direction, y_corr_ms(), y_speed, self._log)
+            self._wait_move_done(t_cmd, y_corr_ms() / 1000.0)
             time.sleep(0.5)
             save(tag)
 
         def x_advance(tag):
             """Move X right + autofocus. True when the right boundary is reached."""
-            self._log("[SWEEP] Moving X right")
+            nonlocal x_steps
+            x_steps = mm_to_x_steps(geo.x_step_mm if geo else 0.4)
+            # Remember the command: the measured displacement of the frames that
+            # follow is what calibrates px/mm, so it has to be attributable.
+            self._last_x_cmd_mm = geo.x_step_mm if geo else 0.4
+            self._log(f"[SWEEP] Moving X right ({x_steps} steps = "
+                      f"{self._last_x_cmd_mm:.2f} mm)")
             t_cmd = time.time()
             move_x(x_steps, 1, self._log)
             self._wait_move_done(t_cmd)
@@ -2219,6 +2518,7 @@ class MotorControlApp(tk.Tk):
             if x_advance("Xr2"):
                 break
 
+            tune()
             col_elapsed = int(time.time() - column_start)
             column_times.append(col_elapsed)
             self._log(
@@ -2229,6 +2529,10 @@ class MotorControlApp(tk.Tk):
         self._log(
             f"[SWEEP] Scan complete or stopped. Total time: {elapsed // 60}m {elapsed % 60}s")
         self._log("[STITCH] writing final mosaic...")
+        # Rewrite the record with what the scan *ended up* using: the auto-tune
+        # may have changed both steps mid-scan, and the folder must describe the
+        # frames in it, not the intent at second zero.
+        self._scan_geo_after_scan(images_dir, phase="end")
         self._stitch_finalize()
         if GLOBAL_STITCH:
             self._start_global_stitch(images_dir)
@@ -2261,8 +2565,12 @@ class MotorControlApp(tk.Tk):
             self._post(lambda: self._gsp_status.set(text))
 
         try:
-            x_steps = mm_to_x_steps(0.4)
-            y_speed = 70
+            geo = getattr(self, "_scan_geo", None)
+            # Only the seek *speed* depends on this; the corner itself is found
+            # from the boundary estimate, so a coarse step is safe and faster.
+            x_steps = mm_to_x_steps(geo.x_step_mm if geo else 0.4)
+            y_speed = geo.y_speed if geo else 70
+            y_ms = int(round(1000 * (geo.y_time_s if geo else 1.2)))
             set_speed(1000, self._log)
             time.sleep(0.2)
 
@@ -2298,8 +2606,8 @@ class MotorControlApp(tk.Tk):
             for i in range(1, 101):
                 self._log(f"[GSP] Moving Y up (attempt {i})")
                 t_cmd = time.time()
-                move_actuator("up", 1200, y_speed, self._log)
-                self._wait_move_done(t_cmd, 1.2)
+                move_actuator("up", y_ms, y_speed, self._log)
+                self._wait_move_done(t_cmd, y_ms / 1000.0)
                 time.sleep(0.5)
                 pct = self._boundary_pct(UPPER_BOUNDARY_THRESHOLD)
                 if pct is not None:

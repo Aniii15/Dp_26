@@ -31,6 +31,11 @@ except ImportError:
     HAS_PIL = False
 
 try:
+    from scan_geometry import ScanGeometry
+except ImportError:            # optional: the sweep still works without it
+    ScanGeometry = None
+
+try:
     import focus_engine as _focus_engine
 except ImportError:              # optional: only needed for region-wise AF
     _focus_engine = None
@@ -934,6 +939,15 @@ class MotorControlApp(tk.Tk):
         Note the callback fires while the stitcher holds its own lock, so this
         must stay cheap: queue the decision and return immediately.
         """
+        # The measured step of an accepted frame is the only position feedback
+        # this machine has; it drives the SCAN GEOMETRY closed loop.  A handful
+        # of float operations, no locks, no I/O.
+        if decision.ok:
+            axis = "X" if (decision.tag or "")[:3].lower().startswith(("xr",)) else "Y"
+            try:
+                self._scan_geo_observe(axis, decision.dx, decision.dy)
+            except Exception:                 # noqa: BLE001 - never break a scan
+                pass
         self._post(lambda: self._stitch_decision_ui(decision))
 
     def _stitch_decision_ui(self, decision):
@@ -1291,10 +1305,132 @@ class MotorControlApp(tk.Tk):
 
     # ── Tab: Sweep ────────────────────────────────────────────────────────────
 
+    def _build_scan_geometry_panel(self, parent):
+        """Step sizes for both axes - and what they actually achieve.
+
+        Neither axis reports its position, so the only honest way to choose a
+        step is to ask the camera: the stitcher measures the real pixel
+        displacement of every frame it accepts.  Those numbers are shown here,
+        and (with Auto-tune on) fed back into the commands between columns.
+        """
+        self._scan_geo = ScanGeometry() if ScanGeometry else None
+        box = self._card(parent, "SCAN GEOMETRY", C["accent2"],
+                         "how far the machine steps between frames, and the "
+                         "overlap that results")
+
+        def row(label, var, unit, width=7):
+            r = tk.Frame(box, bg=C["panel"])
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=label, bg=C["panel"], fg=C["muted"],
+                     font=FONT_SMALL, width=24, anchor="w").pack(side="left")
+            self._make_entry(r, var, w=width).pack(side="left")
+            tk.Label(r, text=unit, bg=C["panel"], fg=C["muted"],
+                     font=FONT_SMALL).pack(side="left", padx=4)
+            return r
+
+        geo = self._scan_geo
+        self.sg_y_time = tk.StringVar(value=f"{geo.y_time_s:.2f}" if geo else "1.20")
+        self.sg_y_speed = tk.StringVar(value=str(geo.y_speed) if geo else "70")
+        self.sg_x_step = tk.StringVar(value=f"{geo.x_step_mm:.2f}" if geo else "0.40")
+        self.sg_y_overlap = tk.StringVar(
+            value=f"{int(100 * geo.target_y_overlap)}" if geo else "65")
+        self.sg_x_overlap = tk.StringVar(
+            value=f"{int(100 * geo.target_x_overlap)}" if geo else "50")
+        self.sg_auto = tk.BooleanVar(value=True)
+
+        row("Y step (pulse time)", self.sg_y_time, "s   (one Y move)")
+        row("Y actuator PWM", self.sg_y_speed, "")
+        row("X step", self.sg_x_step, "mm  (one column)")
+        row("Target Y overlap", self.sg_y_overlap, "% between frames")
+        row("Target X overlap", self.sg_x_overlap, "% between columns")
+
+        ctl = tk.Frame(box, bg=C["panel"])
+        ctl.pack(fill="x", pady=(4, 2))
+        chk = tk.Checkbutton(
+            ctl, text="Auto-tune from the measured step", variable=self.sg_auto,
+            command=self._scan_geo_sync, bg=C["panel"], fg=C["text"],
+            selectcolor=C["surface"], activebackground=C["panel"],
+            activeforeground=C["text"], font=FONT_SMALL)
+        chk.pack(side="left")
+        self._make_btn(ctl, "Use recommendation",
+                       self._scan_geo_recommend).pack(side="left", padx=6)
+
+        for v in (self.sg_y_time, self.sg_y_speed, self.sg_x_step,
+                  self.sg_y_overlap, self.sg_x_overlap):
+            v.trace_add("write", lambda *_: self._scan_geo_sync())
+
+        self._scan_geo_var = tk.StringVar(
+            value="no measurement yet - the pixel scale comes from the first "
+                  "column advance")
+        tk.Label(box, textvariable=self._scan_geo_var, bg=C["panel"],
+                 fg=C["text"], font=FONT_SMALL, anchor="w",
+                 justify="left", wraplength=760).pack(fill="x", pady=(4, 0))
+
+    def _scan_geo_sync(self):
+        """Push the entries into the controller (called on every edit)."""
+        geo = getattr(self, "_scan_geo", None)
+        if geo is None:
+            return
+        def num(var, default, lo=None, hi=None):
+            try:
+                v = float(var.get())
+            except (TypeError, ValueError):
+                return default
+            if lo is not None:
+                v = max(lo, v)
+            if hi is not None:
+                v = min(hi, v)
+            return v
+        geo.y_time_s = num(self.sg_y_time, geo.y_time_s, 0.15, 6.0)
+        geo.y_speed = int(num(self.sg_y_speed, geo.y_speed, 10, 255))
+        geo.x_step_mm = num(self.sg_x_step, geo.x_step_mm, 0.02, 20.0)
+        geo.target_y_overlap = num(self.sg_y_overlap, 65.0, 5.0, 90.0) / 100.0
+        geo.target_x_overlap = num(self.sg_x_overlap, 50.0, 5.0, 90.0) / 100.0
+        geo.auto_tune = bool(self.sg_auto.get())
+        self._scan_geo_refresh()
+
+    def _scan_geo_refresh(self, frame_shape=None):
+        geo = getattr(self, "_scan_geo", None)
+        if geo is None or not hasattr(self, "_scan_geo_var"):
+            return
+        shape = frame_shape or getattr(self, "_frame_shape", None)
+        if shape is None:
+            self._scan_geo_var.set("waiting for the first camera frame")
+            return
+        self._scan_geo_var.set(geo.advice(tuple(shape)))
+
+    def _scan_geo_recommend(self):
+        """Adopt the measured recommendation (once there is a measurement)."""
+        geo = getattr(self, "_scan_geo", None)
+        shape = getattr(self, "_frame_shape", None)
+        if geo is None or shape is None:
+            return
+        h, w = shape[:2]
+        t = geo.suggested_y_time(h)
+        x = geo.suggested_x_step_mm(w)
+        if t is not None:
+            self.sg_y_time.set(f"{t:.2f}")
+        if x is not None:
+            self.sg_x_step.set(f"{x:.2f}")
+        self._log(f"[SWEEP] geometry recommendation applied: "
+                  f"{geo.describe()}")
+        self._scan_geo_sync()
+
+    def _scan_geo_observe(self, axis: str, dx: float, dy: float):
+        """Record one measured step.  Called on the stitcher thread: keep it cheap."""
+        geo = getattr(self, "_scan_geo", None)
+        shape = getattr(self, "_frame_shape", None)
+        if geo is None or shape is None:
+            return
+        geo.observe(axis, dx, dy, tuple(shape[:2]),
+                    moved_mm=self._last_x_cmd_mm if axis == "X" else None)
+
     def _build_tab_sweep(self, parent):
+        self._build_scan_geometry_panel(parent)
         box = self._card(parent, "AUTO SWEEP", C["warn"],
-                         "X: ±0.4 mm (1000 µs)   ·   Y: ±1.3 s (PWM 70)   ·   "
-                         "boundary trigger 10 %")
+                         "Boundary-guided serpentine sweep.  Step sizes are "
+                         "in SCAN GEOMETRY above; the stitch overlap they "
+                         "produce is measured live and corrected.")
 
         btn_row = tk.Frame(box, bg=C["panel"])
         btn_row.pack(fill="x", pady=(0, 6))
@@ -1951,6 +2087,7 @@ class MotorControlApp(tk.Tk):
             weight = self._focus_weight(frame) if frame is not None else None
         if frame is None:
             return
+        self._frame_shape = frame.shape[:2]      # px scale reference
         try:
             filename = f"col{column:02d}_{phase}_{time.strftime('%H%M%S')}.jpg"
             if cv2.imwrite(os.path.join(images_dir, filename), frame):
@@ -2090,11 +2227,40 @@ class MotorControlApp(tk.Tk):
         start_time = time.time()
         self._autosweep_start_time = start_time
 
-        x_steps = mm_to_x_steps(0.4)
-        y_speed = 70
-        y_duration_ms = 1200
-        y_correction_ms = 1500
+        # Step sizes come from SCAN GEOMETRY, which (with auto-tune on) is
+        # corrected from the *measured* pixel displacement of the frames the
+        # stitcher has already accepted.  Nothing here is hardcoded any more.
+        geo = getattr(self, "_scan_geo", None)
+        if geo is not None:
+            self._scan_geo_sync()
+        y_speed = geo.y_speed if geo else 70
+        y_duration_ms = int(round(1000 * (geo.y_time_s if geo else 1.2)))
+        x_steps = mm_to_x_steps(geo.x_step_mm if geo else 0.4)
+        y_correction_ms = int(round(1.25 * y_duration_ms))
+
+        def y_ms() -> int:
+            """Current Y pulse width.
+
+            Read per move rather than captured once, so a correction derived
+            from the frames already stitched takes effect in the same column.
+            """
+            return int(round(1000 * (geo.y_time_s if geo else 1.2)))
+
+        def tune(frame_shape=None):
+            """Adopt measured corrections; log them.  Never raises."""
+            if geo is None:
+                return
+            try:
+                changes = geo.apply(tuple((frame_shape or self._frame_shape)[:2]))
+            except Exception:                 # noqa: BLE001 - never stop a scan
+                return
+            for k, (old, new) in changes.items():
+                self._log(f"[SWEEP] auto-tune {k}: {old} -> {new} "
+                          f"({geo.advice(tuple(self._frame_shape))})")
         max_y_moves = 100
+        self._log(f"[SWEEP] geometry: {geo.describe() if geo else 'defaults'}")
+        self._log(f"[SWEEP]   Y {y_duration_ms} ms per move, X {x_steps} steps "
+                  f"({geo.x_step_mm if geo else 0.4:.2f} mm)")
         LOWER_PCT = 10.0    # lower-boundary trigger
         UPPER_PCT = 20.0    # upper-boundary trigger
         RIGHT_PCT = 10.0    # right-boundary trigger → scan done
@@ -2154,13 +2320,14 @@ class MotorControlApp(tk.Tk):
                 if stop.is_set():
                     return False
                 self._log(f"[SWEEP] Moving Y {direction} (attempt {i})")
-                move_actuator(direction, y_duration_ms, y_speed, self._log)
+                move_actuator(direction, y_ms(), y_speed, self._log)
                 self._wait_motion_stop()
                 haltable_sleep(0.5)
                 save(f"{prefix}_{i}")
                 if i % 4 == 0:
                     self._log("[SWEEP] Running AutoFocus after 4 Y moves")
                     autofocus_y(f"{prefix}{i}_AF")
+                    tune()
                 pct = self._boundary_pct(detect_thr)
                 if pct is not None:
                     self._log(
@@ -2184,7 +2351,13 @@ class MotorControlApp(tk.Tk):
 
         def x_advance(tag):
             """Move X right + autofocus. True when the right boundary is reached."""
-            self._log("[SWEEP] Moving X right")
+            nonlocal x_steps
+            x_steps = mm_to_x_steps(geo.x_step_mm if geo else 0.4)
+            # remember the command: the measured displacement of the frames that
+            # follow is what calibrates px/mm and closes the loop
+            self._last_x_cmd_mm = (geo.x_step_mm if geo else 0.4)
+            self._log(f"[SWEEP] Moving X right ({x_steps} steps = "
+                      f"{self._last_x_cmd_mm:.2f} mm)")
             move_x(x_steps, 1, self._log)
             self._wait_motion_stop()
             haltable_sleep(0.5)
@@ -2243,6 +2416,7 @@ class MotorControlApp(tk.Tk):
             if x_advance("Xr2"):
                 break
 
+            tune()
             col_elapsed = int(time.time() - column_start)
             column_times.append(col_elapsed)
             self._log(

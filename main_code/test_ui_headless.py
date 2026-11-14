@@ -717,6 +717,124 @@ def main() -> int:
             "controls were not restored on re-arm"
     check("estop: button latches, disables motion, re-arms", safety_ui)
 
+    # 16. scan geometry: step sizes are measured, not guessed --------------
+    def geometry_units():
+        import scan_geometry as sg
+        g = sg.ScanGeometry()
+        # the recorded col01: same 1200 ms command, wildly different travel
+        for dy in (412, 310, 315, 243, 427, 264, 421, 218, 434, 242):
+            g.observe("Y", 0, dy, (1080, 1920))
+        assert g.y_samples == 10
+        assert 280 < g.measured_y_px < 360, g.measured_y_px
+        assert 0.6 < g.y_overlap(1080) < 0.75, g.y_overlap(1080)
+
+        # one column advance: 0.4 mm of stepper -> ~363 px of image
+        g.observe("X", 363, -15, (1080, 1920), moved_mm=0.4)
+        assert g.px_per_mm and 850 < g.px_per_mm < 980, g.px_per_mm
+        assert 0.75 < g.x_overlap(1920) < 0.85, g.x_overlap(1920)
+
+        # a 0.4 mm column step re-images 4/5 of the previous column: wasteful
+        wide = g.columns_needed(8000, 1920, 0.81)
+        assert wide >= 15, wide
+        assert g.columns_needed(8000, 1920, 0.50) < wide / 2, "no saving found"
+
+        # the suggestions have to be *stricter* about the target, not random
+        x = g.suggested_x_step_mm(1920)
+        assert x and abs(1920 * (1 - g.target_x_overlap) - x * g.px_per_mm) < 20, x
+
+        # one bad registration must not double the step
+        before = g.y_time_s
+        g.observe("Y", 0, 1070, (1080, 1920))    # nonsense: a whole frame
+        g.observe("Y", 0, 5, (1080, 1920))       # duplicate
+        assert abs(g.suggested_y_time(1080) - before) < 0.35, g.suggested_y_time(1080)
+
+        # auto-tune off means the command never moves on its own
+        g.auto_tune = False
+        assert g.apply((1080, 1920)) == {}
+    check("scan geometry: px/mm, overlap, column count, damping", geometry_units)
+
+    def geometry_panel():
+        geo = app._scan_geo
+        assert geo is not None, "no geometry controller"
+        app._frame_shape = (1080, 1920)
+        app._scan_geo_observe("Y", 0.0, 320.0)
+        app._last_x_cmd_mm = 0.4
+        app._scan_geo_observe("X", 363.0, -10.0)
+        app._scan_geo_refresh()
+        text = app._scan_geo_var.get()
+        assert "overlap" in text and "px/mm" in text, text
+        # entries round-trip into the controller
+        app.sg_x_step.set("1.20")
+        app.sg_y_overlap.set("50")
+        app._scan_geo_sync()
+        assert abs(app._scan_geo.x_step_mm - 1.20) < 1e-6
+        assert abs(app._scan_geo.target_y_overlap - 0.50) < 1e-6
+        # out-of-range typing is clamped, not fatal
+        app.sg_y_time.set("nonsense")
+        app.sg_x_step.set("999")
+        app._scan_geo_sync()
+        assert app._scan_geo.x_step_mm <= 20.0
+        app._scan_geo_recommend()
+        assert float(app.sg_x_step.get()) > 0.4, "recommendation was not applied"
+    check("scan geometry panel: readout, entries, clamping, recommendation", geometry_panel)
+
+    def geometry_drives_the_sweep():
+        """The sweep must use the panel's numbers, not hardcoded ones."""
+        main3._SAFETY.rearm()
+        main3._SAFETY.sender = lambda: (True, "STOP")
+        app.sg_y_time.set("2.00")
+        app.sg_y_speed.set("90")
+        app.sg_x_step.set("1.50")
+        app.sg_auto.set(False)
+        app._scan_geo_sync()
+        seen = []
+        saved = (main3.move_actuator, main3.move_x, app._get_frame,
+                 app._save_sweep_image, main3.set_speed,
+                 app._wait_motion_stop, app._boundary_pct, app._autofocus)
+        moves = [0]
+
+        def rec_act(direction, duration_ms, speed, log_fn=None):
+            seen.append(("Y", duration_ms, speed))
+            moves[0] += 1
+            return True, "OK"
+
+        def rec_x(steps, direction, log_fn=None):
+            seen.append(("X", steps, direction))
+            app._autosweep_stop_evt.set()      # one column is enough to check
+            return True, "OK"
+
+        main3.move_actuator = rec_act
+        main3.move_x = rec_x
+        app._get_frame = lambda: np.zeros((48, 64, 3), np.uint8)
+        app._save_sweep_image = lambda *a, **k: None
+        app._wait_motion_stop = lambda *a, **k: True
+        main3.set_speed = lambda *a, **k: (True, "OK")
+        app._autofocus = lambda **k: None
+        # the boundary is "found" as soon as we have moved twice
+        app._boundary_pct = lambda *a, **k: {
+            "left": 0.0, "right": 0.0,
+            "upper": 50.0 if moves[0] >= 2 else 0.0,
+            "lower": 50.0 if moves[0] >= 2 else 0.0}
+        try:
+            app._autosweep_running = True
+            app._autosweep_stop_evt.clear()
+            app._sweep_worker()
+            app._poll_ui_queue()
+        finally:
+            (main3.move_actuator, main3.move_x, app._get_frame,
+             app._save_sweep_image, main3.set_speed,
+             app._wait_motion_stop, app._boundary_pct, app._autofocus) = saved
+        ys = [x for x in seen if x[0] == "Y"]
+        assert len(ys) >= 3, ys
+        # the sweep moves use the panel's pulse width ...
+        assert all(abs(d - 2000) <= 1 for _, d, _ in ys[:2]), ys
+        # ... the corrective move is the fixed 1.25x of it, still derived
+        assert abs(ys[2][1] - 2500) <= 1, ys
+        assert all(s == 90 for _, _, s in ys), ys
+        assert abs(app._last_x_cmd_mm - 1.50) < 1e-6, app._last_x_cmd_mm
+    check("scan geometry: the sweep obeys the panel (Y ms, PWM, X mm)",
+          geometry_drives_the_sweep)
+
     print()
     if failures:
         print(f"{len(failures)} FAILURE(S)")

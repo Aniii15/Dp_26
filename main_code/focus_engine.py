@@ -76,8 +76,9 @@ __all__ = [
 class FocusConfig:
     """Everything that decides how expensive and how thorough a scan is.
 
-    Steps are Z-motor steps (the M1 axis is 1600 steps/mm, so 200 steps =
-    0.125 mm).  The defaults scan ~6 mm of travel at 0.125 mm - slower than the
+    Steps are Z-motor steps (Z is 3200 pulses/rev on a 4 mm lead screw =
+    800 steps/mm, so 100 steps = 0.125 mm).  The defaults scan ~3.75 mm of
+    travel at 0.125 mm - slower than the
     old hill climb per step, but bounded, and it always brackets the peak.
     """
 
@@ -110,7 +111,7 @@ class FocusConfig:
     max_luma: float = 252.0          # blown-out tile
 
     # search
-    range_steps: int = 6000
+    range_steps: int = 3000
     """Cap on how far the search may walk from where it started, both directions
     (so 6000 = +-3.75 mm around the start).
 
@@ -119,14 +120,14 @@ class FocusConfig:
     let the search use the whole of ``z_travel_limit`` - the right choice when
     the part's depth envelope is unknown, a bad one when it is known and small,
     because then every capture spent outside the envelope is pure cost."""
-    coarse_steps: int = 200          # 0.125 mm
-    fine_steps: int = 50             # 31 um
+    coarse_steps: int = 100          # 0.125 mm
+    fine_steps: int = 25             # 31 um
     fine_samples: int = 5            # samples per fine sweep (odd)
-    z_travel_limit: int = 24000      # 15 mm either way: hard safety clamp
+    z_travel_limit: int = 12000      # 15 mm either way: hard safety clamp
     max_samples: int = 140           # budget guard for one scan
     settle_s: float = 0.18           # wait after every Z move before capture
     backlash_steps: int = 0          # approach every target from below if > 0
-    predictive_window: int = 600     # window width when a hint is available
+    predictive_window: int = 300     # window width when a hint is available
 
     # decision
     in_focus_ratio: float = 0.90     # tile counts as focused at >=90 % of its peak
@@ -160,7 +161,7 @@ class FocusConfig:
     reference, so a low-contrast part is not penalised for being low-contrast.
     """
 
-    def steps_to_mm(self, steps: float, steps_per_mm: float = 1600.0) -> float:
+    def steps_to_mm(self, steps: float, steps_per_mm: float = 800.0) -> float:
         return steps / steps_per_mm
 
 
@@ -285,7 +286,7 @@ class FocusResult:
             return 0.0
         return float(self.in_focus_area)
 
-    def recommendation(self, steps_per_mm: float = 1600.0) -> list[str]:
+    def recommendation(self, steps_per_mm: float = 800.0) -> list[str]:
         """Operator-facing advice, in the order they should act on it."""
         out: list[str] = []
         if not self.bracketed and self.samples:
@@ -315,7 +316,7 @@ class FocusResult:
             out.append("Focus locked and bracketed by sharp samples on both sides.")
         return out
 
-    def summary(self, steps_per_mm: float = 1600.0) -> str:
+    def summary(self, steps_per_mm: float = 800.0) -> str:
         mm = self.z_peak / steps_per_mm
         if not self.bracketed:
             return (f"NO PEAK (curve varies {self.curve_variation * 100:.1f}%), "
@@ -711,7 +712,7 @@ class AutoFocus:
 
     def __init__(self, move, capture, cfg: FocusConfig | None = None,
                  wait=None, log=print, sleep=time.sleep,
-                 steps_per_mm: float = 1600.0, origin: float = 0.0):
+                 steps_per_mm: float = 800.0, origin: float = 0.0):
         self.move = move
         self.capture = capture
         self.cfg = cfg or FocusConfig()

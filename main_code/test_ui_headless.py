@@ -331,7 +331,8 @@ def _install_stub_net():
     if "requests" not in sys.modules:
         req = types.ModuleType("requests")
         req.get = lambda *a, **k: (_ for _ in ()).throw(OSError("no network"))
-        req.exceptions = types.SimpleNamespace(RequestException=OSError)
+        req.exceptions = types.SimpleNamespace(
+            RequestException=OSError, ConnectionError=OSError, Timeout=OSError)
         sys.modules["requests"] = req
 
 
@@ -524,20 +525,20 @@ def main() -> int:
     def scan_geometry():
         geo = getattr(app, "_scan_geo", None)
         assert geo is not None, "no geometry controller on the app"
-        for attr in ("sg_y_time", "sg_y_speed", "sg_x_step", "sg_y_overlap",
+        for attr in ("sg_y_step", "sg_x_step", "sg_y_overlap",
                      "sg_x_overlap", "sg_auto", "_scan_geo_var"):
             assert hasattr(app, attr), f"missing {attr}"
 
         # the entries seed the controller, and editing one is respected
-        app.sg_y_time.set("1.45")
+        app.sg_y_step.set("0.45")
         app.sg_x_step.set("0.90")
-        assert abs(geo.y_time_s - 1.45) < 1e-9, geo.y_time_s
+        assert abs(geo.y_step_mm - 0.45) < 1e-9, geo.y_step_mm
         assert abs(geo.x_step_mm - 0.90) < 1e-9, geo.x_step_mm
 
         # garbage in an entry must fall back, not raise or wedge the sweep
-        app.sg_y_time.set("banana")
+        app.sg_y_step.set("banana")
         app.sg_x_step.set("")
-        assert geo.y_time_s > 0 and geo.x_step_mm > 0, (geo.y_time_s, geo.x_step_mm)
+        assert geo.y_step_mm > 0 and geo.x_step_mm > 0, (geo.y_step_mm, geo.x_step_mm)
 
         # the frame size arrives from the first captured frame
         app._frame_shape = (1080, 1920)
@@ -599,7 +600,7 @@ def main() -> int:
         # recalibrate restores the defaults
         app._scan_geo_reset()
         assert abs(app._scan_geo.x_step_mm - 0.40) < 1e-9, app._scan_geo.x_step_mm
-        assert app.sg_y_time.get() == "1.20", app.sg_y_time.get()
+        assert app.sg_y_step.get() == "0.35", app.sg_y_step.get()
     check("SCAN GEOMETRY panel + live/global calibration loop", scan_geometry)
 
     # 11. the GUI's own autofocus path, driven by a fake motor + camera ------
@@ -628,6 +629,7 @@ def main() -> int:
             return True, "ok"
 
         main3.move_z = fake_move_z
+        main3.wait_idle = lambda axis, timeout_s=0.0: True   # firmware /status
         app._wait_motion_stop = lambda timeout_s=10.0: True
         app._af_mode_var.set("Region-wise (recommended)")
         app.af_range_var.set("4000")

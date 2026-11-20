@@ -15,7 +15,7 @@ Design decisions that matter for a live capture:
   frame is compared against the right place instead of against a stale one.
 * **Drift control by anchors.**  Each frame can be registered against the last
   accepted frame *and* older overlapping ones; the implied global poses are
-  averaged.  Chaining purely pairwise (what ``blade_stitch.py`` does) lets
+  averaged.  Chaining purely pairwise (what the earlier, removed ``blade_stitch.py`` did) lets
   every small error accumulate - measured 1% loop-closure error per column,
   i.e. ~120 px of shear over a 10 000 px travel.
 * **Partial output never stops.**  Every ``flush_every`` accepted frames the

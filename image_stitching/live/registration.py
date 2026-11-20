@@ -1,6 +1,6 @@
 """Bounded feature registration between consecutive scan frames.
 
-The original ``blade_stitch.estimate()`` seeded ``findTransformECC`` with
+The original ``blade_stitch.estimate()`` (earlier batch stitcher, since removed) seeded ``findTransformECC`` with
 ``cv2.phaseCorrelate`` and accepted whatever came back if ``cc > 0.12``.  On
 these frames that is unsafe in two ways:
 

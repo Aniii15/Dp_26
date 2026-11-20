@@ -1,6 +1,6 @@
 """Streaming mosaic accumulator.
 
-Differences from ``blade_stitch.compose()``:
+Differences from ``blade_stitch.compose()`` (the earlier batch stitcher, since removed):
 
 * No batch pass: each accepted frame is blended into a growing canvas the
   moment it is registered, so a partial mosaic exists after every few frames

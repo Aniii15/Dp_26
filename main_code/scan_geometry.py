@@ -8,7 +8,7 @@ The sweep moves in two directions and both were fixed constants inside
 * **X** - a stepper given a distance (``0.4 mm`` = 320 steps), but nobody
   converted that to *overlap*, which is the only thing the stitcher cares about.
 
-Measured on the two recorded scans (``image_stitching/from_scratch``), with the
+Measured on the two recorded scans (``sample_scans/``), with the
 same registrar the live stitcher uses:
 
 ===============================================  ============  ============

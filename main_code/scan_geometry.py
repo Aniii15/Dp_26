@@ -3,8 +3,9 @@
 The sweep moves in two directions and both were fixed constants inside
 ``_sweep_worker``:
 
-* **Y** - a linear actuator driven by PWM for a fixed time (``1200 ms``).
-  Time is not distance.
+* **Y** - originally a linear actuator driven by PWM for a fixed time
+  (``1200 ms``; time is not distance).  It is now a stepper on a 4 mm lead
+  screw (800 pulses/mm) and is commanded in mm: ``y_step_mm``.
 * **X** - a stepper given a distance (``0.4 mm`` = 320 steps), but nobody
   converted that to *overlap*, which is the only thing the stitcher cares about.
 
@@ -134,14 +135,15 @@ def _ewma(prev: float | None, value: float, alpha: float) -> float:
 class ScanGeometry:
     """Commands for both sweep axes, the calibration, and what to change.
 
-    ``y_time_s`` / ``y_speed`` / ``x_step_mm`` are what gets sent to the hardware.
+    ``y_step_mm`` / ``x_step_mm`` are what gets sent to the hardware.
     The ``measured_*`` fields are filled from the stitcher and are what the
     operator should actually look at; :meth:`advice` turns them into one line.
     """
 
     # ── what we command ─────────────────────────────────────────────────────
-    y_speed: int = 70
-    y_time_s: float = 1.20
+    y_step_mm: float = 0.35
+    """Y travel per sweep move.  0.35 mm is what the old 1.2 s @ PWM 70
+    actuator pulse moved on average."""
     x_step_mm: float = 0.40
     x_return_mm: float = 0.40
     """X travel of the return move at the end of a column.  Kept equal to
@@ -321,14 +323,14 @@ class ScanGeometry:
         return int(np.ceil(max(blade_w_px - frame_w, 0) / advance)) + 1
 
     # ── what to change ──────────────────────────────────────────────────────
-    def suggested_y_time(self, frame_h: int | None = None) -> float | None:
+    def suggested_y_step_mm(self, frame_h: int | None = None) -> float | None:
         h = frame_h or (self.frame_hw[0] if self.frame_hw else None)
         if self.measured_y_px is None or self.measured_y_px < 1.0 or not h:
             return None
         want = max(1.0, h * (1.0 - self.target_y_overlap))
         ratio = float(np.clip(want / self.measured_y_px,
                               1.0 - self.max_adjust, 1.0 + self.max_adjust))
-        return float(np.clip(self.y_time_s * ratio, 0.15, 6.0))
+        return float(np.clip(self.y_step_mm * ratio, 0.04, 2.0))
 
     def suggested_x_step_mm(self, frame_w: int | None = None) -> float | None:
         w = frame_w or (self.frame_hw[1] if self.frame_hw else None)
@@ -343,10 +345,10 @@ class ScanGeometry:
         if not self.auto_tune or not frame_shape:
             return changes
         h, w = frame_shape[:2]
-        t = self.suggested_y_time(h)
-        if t is not None and abs(t - self.y_time_s) > 0.005:
-            changes["y_time_s"] = (round(self.y_time_s, 2), round(t, 2))
-            self.y_time_s = t
+        t = self.suggested_y_step_mm(h)
+        if t is not None and abs(t - self.y_step_mm) > 0.005:
+            changes["y_step_mm"] = (round(self.y_step_mm, 2), round(t, 2))
+            self.y_step_mm = t
         x = self.suggested_x_step_mm(w)
         if x is not None and abs(x - self.x_step_mm) > 0.005:
             changes["x_step_mm"] = (round(self.x_step_mm, 2), round(x, 2))
@@ -382,7 +384,7 @@ class ScanGeometry:
         return "  ·  ".join(parts)
 
     def describe(self) -> str:
-        bits = [f"Y {self.y_time_s:.2f}s @ PWM {self.y_speed}",
+        bits = [f"Y {self.y_step_mm:.2f} mm",
                 f"X {self.x_step_mm:.2f} mm"]
         if self.px_per_mm:
             bits.append(f"scale {self.px_per_mm:.0f} px/mm")
@@ -398,7 +400,7 @@ class ScanGeometry:
         if not shape:
             return "no measurement yet"
         h, w = shape[:2]
-        t = self.suggested_y_time(h)
+        t = self.suggested_y_step_mm(h)
         x = self.suggested_x_step_mm(w)
         if t is None and x is None:
             return "no measurement yet"
@@ -419,7 +421,15 @@ class ScanGeometry:
     @classmethod
     def from_dict(cls, d: dict) -> "ScanGeometry":
         known = {f for f in cls.__dataclass_fields__}
-        kw = {k: v for k, v in (d or {}).items() if k in known}
+        d = dict(d or {})
+        if "y_step_mm" not in d and "y_time_s" in d:
+            # calibration saved by the old timed-actuator build: carry the
+            # learned step over at the old 1.2 s ~= 0.35 mm rate
+            try:
+                d["y_step_mm"] = float(d["y_time_s"]) * (0.35 / 1.20)
+            except (TypeError, ValueError):
+                pass
+        kw = {k: v for k, v in d.items() if k in known}
         fh = kw.get("frame_hw")
         if isinstance(fh, (list, tuple)) and len(fh) == 2:
             kw["frame_hw"] = (int(fh[0]), int(fh[1]))
@@ -477,7 +487,7 @@ def geometry_lines(geo: ScanGeometry, motion: dict | None = None,
     """Report section: achieved steps, overlaps, and what to change."""
     shape = frame_shape or geo.frame_hw
     lines = ["", "Sweep geometry (measured, not commanded):",
-             f"  Y pulse {geo.y_time_s:.2f} s @ PWM {geo.y_speed}, "
+             f"  Y step {geo.y_step_mm:.2f} mm, "
              f"X step {(x_cmd_mm or geo.x_step_mm):.2f} mm"]
     if not shape:
         lines.append("  no frame size recorded - cannot express overlap")

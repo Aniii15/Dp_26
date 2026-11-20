@@ -1,8 +1,10 @@
 """
 ESP32 Wireless Motor Control — Desktop GUI  (run: python main3.py)
 
-Motors: M1 Z-axis (1600 steps = 1 mm), M2 rotation (1600 steps/rev),
-M3 X-axis (800 steps = 1 mm), linear actuator Y (BTS7960, PWM).
+Motors: X, Y, Z = MKS SERVO42D closed-loop steppers on 4 mm-pitch lead
+screws (3200 pulses/rev -> 800 pulses = 1 mm), R rotation on TB6600
+(1600 steps/rev).  Firmware: esp32_motors - a move is queued and the HTTP reply
+comes back at once; /status reports the pulses still queued per axis.
 Talks to the ESP32 over WiFi via HTTP GET.
 
 Features: live HDMI camera feed, visual motion detection (closed-loop
@@ -58,8 +60,20 @@ ESP32_PORT = 80
 BASE_URL = f"http://{ESP32_IP}:{ESP32_PORT}"
 TIMEOUT_S = 5
 
-Z_STEPS_PER_MM = 1600
-X_STEPS_PER_MM = 800
+# X/Y/Z mechanics: 3200 pulses per motor revolution, 4 mm lead-screw pitch.
+PULSES_PER_REV = 3200
+SCREW_PITCH_MM = 4.0
+STEPS_PER_MM = PULSES_PER_REV / SCREW_PITCH_MM   # 800 pulses = 1 mm (1.25 um/pulse)
+Z_STEPS_PER_MM = STEPS_PER_MM
+X_STEPS_PER_MM = STEPS_PER_MM
+Y_STEPS_PER_MM = STEPS_PER_MM
+
+# Y was a timed linear actuator (1.2 s @ PWM 70 ~= 0.35 mm); it is now a
+# stepper, so the sweep commands it in mm (ScanGeometry.y_step_mm).
+Y_CORRECTION_RATIO = 1.25   # corrective / back-off Y move vs. a sweep move
+# DIR pin level for each Y direction.  VERIFY ON THE RIG; swap if inverted.
+Y_DIR = {"down": 0, "up": 1}
+MOVE_TIMEOUT_S = 30.0       # longest wait for a queued move to finish
 R_STEPS_PER_REV = 1600
 DEGREES_PER_STEP = 360 / R_STEPS_PER_REV
 
@@ -90,15 +104,15 @@ FOCUS_CONFIG = {
     # as the peak is bracketed, and a prediction narrows it further.  Set it to
     # the blade's real depth envelope + margin once you know it - every capture
     # outside that envelope is pure cost.
-    "range_steps": 6000,
-    "coarse_steps": 200,      # 0.125 mm - resolution of the bracketing walk
-    "fine_steps": 50,         # 31 um - refinement pass around the peak
-    "z_travel_limit": 24000,  # 15 mm either way: refuse to drive further
+    "range_steps": 3000,     # +-0.94 mm cap
+    "coarse_steps": 100,      # 0.125 mm - resolution of the bracketing walk
+    "fine_steps": 25,         # 31 um - refinement pass around the peak
+    "z_travel_limit": 12000,  # 15 mm either way: refuse to drive further
     "settle_s": 0.20,         # wait after each Z move before grabbing a frame
     "backlash_steps": 0,      # set to ~2x the measured backlash if Z is sloppy
     "in_focus_ratio": 0.90,   # tile counts as focused at 90 % of its own best
     "max_samples": 60,        # hard cap on captures per focus scan
-    "predictive_window": 600,  # window confirmed around a predicted focus
+    "predictive_window": 300,  # window confirmed around a predicted focus (0.375 mm)
     # Focus on the LEFT 40 % of the view (x0, y0, x1, y1 as fractions).  The
     # blade curves away from the lens towards the right, so no single Z makes
     # the whole frame sharp; the right side is seen again - by the sharp left
@@ -225,8 +239,43 @@ def move_r(steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
     return http_get("/r", {"steps": steps, "dir": direction}, log_fn)
 
 
-def move_actuator(direction: str, duration_ms: int, speed: int, log_fn=None) -> tuple[bool, str]:
-    return http_get("/actuator", {"dir": direction, "time": duration_ms, "speed": speed}, log_fn)
+def move_y(steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
+    return http_get("/y", {"steps": steps, "dir": direction}, log_fn)
+
+
+def move_y_dir(direction: str, mm: float, log_fn=None) -> tuple[bool, str]:
+    """Move Y by ``mm`` towards "up" / "down" (replaces the timed actuator)."""
+    return move_y(mm_to_y_steps(mm), Y_DIR[direction], log_fn)
+
+
+def axis_remaining(axis: str) -> int | None:
+    """Pulses still queued on ``axis`` ("X"/"Y"/"Z"/"R"), None if unreadable.
+
+    The firmware's /status reply looks like ``"X=0 Y=120 Z=0 R=0 "``."""
+    ok, resp = http_get("/status")
+    if not ok:
+        return None
+    for tok in resp.split():
+        k, _, v = tok.partition("=")
+        if k == axis and v.isdigit():
+            return int(v)
+    return None
+
+
+def wait_idle(axis: str, timeout_s: float = MOVE_TIMEOUT_S) -> bool:
+    """Block until the firmware has emitted every queued pulse on ``axis``.
+
+    esp32_motors answers "OK" *before* the move happens, so without this a
+    frame grabbed right after a move command is taken mid-move."""
+    end = time.time() + timeout_s
+    while time.time() < end:
+        rem = axis_remaining(axis)
+        if rem is None:
+            return False
+        if rem == 0:
+            return True
+        time.sleep(0.02)
+    return False
 
 
 def emergency_stop(log_fn=None) -> tuple[bool, str]:
@@ -252,6 +301,10 @@ def mm_to_z_steps(mm: float) -> int:
 
 def mm_to_x_steps(mm: float) -> int:
     return max(1, int(round(mm * X_STEPS_PER_MM)))
+
+
+def mm_to_y_steps(mm: float) -> int:
+    return max(1, int(round(mm * Y_STEPS_PER_MM)))
 
 
 def degrees_to_r_steps(deg: float) -> int:
@@ -981,50 +1034,6 @@ class MotorControlApp(tk.Tk):
 
         update_calc()
 
-    # ── Linear Actuator Panel ─────────────────────────────────────────────────
-
-    def _build_actuator_panel(self, parent):
-        f = self._make_panel(parent, "LINEAR ACTUATOR",
-                             "BTS7960 · PWM ramp control")
-
-        param_row = tk.Frame(f, bg=C["panel"])
-        param_row.pack(fill="x", pady=4)
-        tk.Label(param_row, text="Speed\n(0-255)", bg=C["panel"],
-                 fg=C["muted"], font=FONT_SMALL).pack(side="left")
-        self.act_speed = tk.StringVar(value="70")
-        self._make_entry(param_row, self.act_speed,
-                         w=6).pack(side="left", padx=6)
-
-        tk.Label(param_row, text="Duration\n(ms)", bg=C["panel"],
-                 fg=C["muted"], font=FONT_SMALL).pack(side="left")
-        self.act_duration = tk.StringVar(value="1000")
-        self._make_entry(param_row, self.act_duration,
-                         w=7).pack(side="left", padx=6)
-
-        tk.Scale(f, from_=0, to=255, orient="horizontal", variable=self.act_speed,
-                 bg=C["panel"], fg=C["text"], troughcolor=C["surface"],
-                 highlightthickness=0, font=FONT_SMALL, label="PWM Speed"
-                 ).pack(fill="x", pady=2)
-
-        btn_row = tk.Frame(f, bg=C["panel"])
-        btn_row.pack(fill="x", pady=4)
-        self._make_btn(btn_row, "▲ UP", lambda: self._actuator_move("up"),
-                       bg="#2b4a7a").pack(side="left", expand=True, fill="x", padx=2)
-        self._make_btn(btn_row, "▼ DOWN", lambda: self._actuator_move("down"),
-                       bg="#2b4a7a").pack(side="left", expand=True, fill="x", padx=2)
-        self._make_btn(btn_row, "■ STOP", lambda: self._threaded(emergency_stop, self._log),
-                       bg=C["danger"]).pack(side="left", expand=True, fill="x", padx=2)
-
-    def _actuator_move(self, direction: str):
-        try:
-            speed = int(self.act_speed.get())
-            dur = int(self.act_duration.get())
-        except ValueError:
-            self._log("[ACT] Invalid speed or duration")
-            return
-        self._log(f"ACT → {direction.upper()} speed={speed} duration={dur}ms")
-        self._threaded(move_actuator, direction, dur, speed, self._log)
-
     # ── Global Speed Panel ────────────────────────────────────────────────────
 
     def _build_speed_panel(self, parent):
@@ -1253,8 +1262,7 @@ class MotorControlApp(tk.Tk):
             tk.Label(r, text=unit, bg=C["panel"], fg=C["muted"],
                      font=FONT_SMALL).pack(side="left", padx=4)
 
-        self.sg_y_time = tk.StringVar(value=f"{geo.y_time_s:.2f}" if geo else "1.20")
-        self.sg_y_speed = tk.StringVar(value=str(geo.y_speed) if geo else "70")
+        self.sg_y_step = tk.StringVar(value=f"{geo.y_step_mm:.2f}" if geo else "0.35")
         self.sg_x_step = tk.StringVar(value=f"{geo.x_step_mm:.2f}" if geo else "0.40")
         self.sg_y_overlap = tk.StringVar(
             value=f"{int(round(100 * geo.target_y_overlap))}" if geo else "65")
@@ -1262,8 +1270,7 @@ class MotorControlApp(tk.Tk):
             value=f"{int(round(100 * geo.target_x_overlap))}" if geo else "50")
         self.sg_auto = tk.BooleanVar(value=bool(geo.auto_tune) if geo else True)
 
-        row("Y step (pulse time)", self.sg_y_time, "s   per Y move")
-        row("Y actuator PWM", self.sg_y_speed, "10-255")
+        row("Y step", self.sg_y_step, "mm  per Y move")
         row("X step", self.sg_x_step, "mm  per column")
         row("Target Y overlap", self.sg_y_overlap, "% between frames")
         row("Target X overlap", self.sg_x_overlap, "% between columns")
@@ -1281,7 +1288,7 @@ class MotorControlApp(tk.Tk):
         self._make_btn(ctl, "Recalibrate",
                        self._scan_geo_reset).pack(side="left")
 
-        for v in (self.sg_y_time, self.sg_y_speed, self.sg_x_step,
+        for v in (self.sg_y_step, self.sg_x_step,
                   self.sg_y_overlap, self.sg_x_overlap):
             v.trace_add("write", lambda *_: self._scan_geo_sync())
 
@@ -1309,8 +1316,7 @@ class MotorControlApp(tk.Tk):
                 v = min(hi, v)
             return v
 
-        geo.y_time_s = num(self.sg_y_time, geo.y_time_s, 0.15, 6.0)
-        geo.y_speed = int(num(self.sg_y_speed, geo.y_speed, 10, 255))
+        geo.y_step_mm = num(self.sg_y_step, geo.y_step_mm, 0.02, 20.0)
         geo.x_step_mm = num(self.sg_x_step, geo.x_step_mm, 0.02, 20.0)
         geo.target_y_overlap = num(self.sg_y_overlap,
                                   100 * geo.target_y_overlap, 5.0, 90.0) / 100.0
@@ -1331,10 +1337,10 @@ class MotorControlApp(tk.Tk):
         if geo is None or not self._frame_shape:
             self._log("[SWEEP] geometry: no measurement yet, nothing to apply")
             return
-        t = geo.suggested_y_time(self._frame_shape[0])
+        t = geo.suggested_y_step_mm(self._frame_shape[0])
         x = geo.suggested_x_step_mm(self._frame_shape[1])
-        if t is not None and hasattr(self, "sg_y_time"):
-            self.sg_y_time.set(f"{t:.2f}")
+        if t is not None and hasattr(self, "sg_y_step"):
+            self.sg_y_step.set(f"{t:.2f}")
         if x is not None and hasattr(self, "sg_x_step"):
             self.sg_x_step.set(f"{x:.2f}")
         self._log(f"[SWEEP] geometry recommendation applied: {geo.describe()}")
@@ -1345,7 +1351,7 @@ class MotorControlApp(tk.Tk):
         if _scan_geometry is None:
             return
         self._scan_geo = _scan_geometry.ScanGeometry()
-        for var, val in ((self.sg_y_time, "1.20"), (self.sg_y_speed, "70"),
+        for var, val in ((self.sg_y_step, "0.35"),
                          (self.sg_x_step, "0.40"), (self.sg_y_overlap, "65"),
                          (self.sg_x_overlap, "50")):
             var.set(val)
@@ -1553,7 +1559,7 @@ class MotorControlApp(tk.Tk):
         self.af_range_var = tk.StringVar(
             value=str(FOCUS_CONFIG["range_steps"]))
         self.af_pred_var = tk.StringVar(
-            value=str(FOCUS_CONFIG.get("predictive_window", 600)))
+            value=str(FOCUS_CONFIG.get("predictive_window", 300)))
         self.af_limit_var = tk.StringVar(
             value=str(FOCUS_CONFIG["z_travel_limit"]))
         self.af_backlash_var = tk.StringVar(
@@ -1574,9 +1580,9 @@ class MotorControlApp(tk.Tk):
 
         # per-axis step sizes (C = coarse search step, F = fine step, D = settle)
         self.af_y_c_var, self.af_y_m_var, self.af_y_f_var, self.af_y_d_var = \
-            (tk.StringVar(value=v) for v in ("200", "100", "50", "0.25"))
+            (tk.StringVar(value=v) for v in ("100", "50", "25", "0.25"))
         self.af_x_c_var, self.af_x_m_var, self.af_x_f_var, self.af_x_d_var = \
-            (tk.StringVar(value=v) for v in ("200", "100", "50", "0.25"))
+            (tk.StringVar(value=v) for v in ("100", "50", "25", "0.25"))
         self._build_af_row(af, "AF Y-Shifts:", C["warn"],
                            (self.af_y_c_var, self.af_y_m_var,
                             self.af_y_f_var, self.af_y_d_var))
@@ -1694,7 +1700,14 @@ class MotorControlApp(tk.Tk):
 
         row2 = tk.Frame(parent, bg=C["bg"])
         row2.pack(fill="x", padx=2)
-        self._build_actuator_panel(row2)
+        self._build_axis_panel(
+            row2, "Y AXIS", tag="Y",
+            modes=("mm", "steps"), default_mode="mm", default_val="0.35",
+            to_steps=lambda v, m: mm_to_y_steps(v) if m == "mm" else int(v),
+            describe=lambda v, m: (f"= {mm_to_y_steps(v):,} pulses" if m == "mm"
+                                   else f"= {int(v):,} pulses (direct)"),
+            mover=move_y, buttons=[("▲ UP", Y_DIR["up"], "up"),
+                                   ("▼ DOWN", Y_DIR["down"], "down")])
         self._build_speed_panel(row2)
 
         self._build_cmd_bar(parent)
@@ -1794,7 +1807,7 @@ class MotorControlApp(tk.Tk):
             return [int(c_var.get()), int(m_var.get()), int(f_var.get())], float(d_var.get())
         except ValueError:
             self._log(f"[AF] Invalid {tag} AF parameters, using defaults")
-            return [1600, 800, 400], 2.0
+            return [800, 400, 200], 2.0
 
     def _start_autofocus(self):
         try:
@@ -1827,7 +1840,7 @@ class MotorControlApp(tk.Tk):
         """
         if self._af_mode_var.get().startswith("Region"):
             return self._autofocus_regions(hint=hint, u=u, v=v, stack=stack)
-        return self._autofocus_cnn(steps or [1600, 800, 400], delay or 2.0)
+        return self._autofocus_cnn(steps or [800, 400, 200], delay or 2.0)
 
     # ── Region-wise engine (the fix for curved blades) ────────────────────────
 
@@ -1861,7 +1874,7 @@ class MotorControlApp(tk.Tk):
             move_z(abs(int(round(delta))), 1 if delta > 0 else 0)
 
         def wait():
-            self._wait_motion_stop()
+            self._wait_axis("Z")
 
         return _focus_engine.AutoFocus(
             move, self._get_frame, cfg, wait=wait, log=self._log,
@@ -1873,7 +1886,7 @@ class MotorControlApp(tk.Tk):
         if _focus_engine is None:
             self._log(
                 "[AF] focus_engine.py is missing — falling back to the CNN")
-            return self._autofocus_cnn([1600, 800, 400], 2.0)
+            return self._autofocus_cnn([800, 400, 200], 2.0)
         if self._get_frame() is None:
             self._log("[AF] No feed available, aborting autofocus")
             return None
@@ -1961,11 +1974,11 @@ class MotorControlApp(tk.Tk):
     # wants speed on hundreds of stops; a single-shot focus before a capture
     # wants accuracy and can afford a finer walk.
     _FOCUS_PRESETS = {
-        "fast": {"range": "3000", "coarse": "300", "fine": "100", "settle": "0.12",
+        "fast": {"range": "1500", "coarse": "150", "fine": "50", "settle": "0.12",
                  "note": "Fast: ±0.94 mm cap, 0.19 mm walk, 0.12 s settle"},
-        "balanced": {"range": "6000", "coarse": "200", "fine": "50", "settle": "0.20",
+        "balanced": {"range": "3000", "coarse": "100", "fine": "25", "settle": "0.20",
                      "note": "Balanced: ±1.9 mm cap, 0.125 mm walk, 0.20 s settle"},
-        "accurate": {"range": "0", "coarse": "120", "fine": "40", "settle": "0.30",
+        "accurate": {"range": "0", "coarse": "60", "fine": "20", "settle": "0.30",
                      "note": "Accurate: whole travel, 75 um walk, 0.30 s settle"},
     }
 
@@ -2036,6 +2049,7 @@ class MotorControlApp(tk.Tk):
 
         def step_and_get(dir_mult, size):
             move_z(size, 1 if dir_mult > 0 else 0)
+            wait_idle("Z")      # firmware replies before the move is done
             time.sleep(delay)
             return self._get_frame()
 
@@ -2328,23 +2342,22 @@ class MotorControlApp(tk.Tk):
         geo = getattr(self, "_scan_geo", None)
         if geo is not None and not geo.frame_hw and self._frame_shape:
             geo.frame_hw = tuple(self._frame_shape)
-        y_speed = geo.y_speed if geo else 70
         x_steps = mm_to_x_steps(geo.x_step_mm if geo else 0.4)
         max_y_moves = 100
         self._last_sweep_scan_dir = images_dir
         self._log(f"[SWEEP] geometry: {geo.describe() if geo else 'defaults'}")
         self._scan_geo_after_scan(images_dir, phase="start")
 
-        def y_ms() -> int:
-            """Current Y pulse width.
+        def y_mm() -> float:
+            """Current Y step in mm.
 
             Read per move rather than captured once, so a correction derived
             from frames already stitched takes effect in the same column.
             """
-            return int(round(1000 * (geo.y_time_s if geo else 1.2)))
+            return geo.y_step_mm if geo else 0.35
 
-        def y_corr_ms() -> int:
-            return int(round(1250 * (geo.y_time_s if geo else 1.2)))
+        def y_corr_mm() -> float:
+            return Y_CORRECTION_RATIO * y_mm()
 
         def tune():
             """Adopt measured corrections.  Never raises, never stops a scan."""
@@ -2400,7 +2413,7 @@ class MotorControlApp(tk.Tk):
                     # Every scan leaves the stage *on* the focus, so what the
                     # trend can measure per stop is how far focus moved since the
                     # previous stop - which is exactly what a hint means here.
-                    hint = float(np.clip(pred, -6000, 6000))
+                    hint = float(np.clip(pred, -3000, 3000))
                     self._log(f"[AF] predicted shift {hint:+.0f} steps from the "
                               f"last stop ({len(self._focus_trend)} points)")
             self._autofocus(hint=hint, u=float(column), v=float(y_index[0]))
@@ -2420,8 +2433,8 @@ class MotorControlApp(tk.Tk):
                     return False
                 self._log(f"[SWEEP] Moving Y {direction} (attempt {i})")
                 t_cmd = time.time()
-                move_actuator(direction, y_ms(), y_speed, self._log)
-                self._wait_move_done(t_cmd, y_ms() / 1000.0)
+                move_y_dir(direction, y_mm(), self._log)
+                self._wait_move_done(t_cmd, axis="Y")
                 time.sleep(0.5)
                 save(f"{prefix}_{i}")
                 if i % 4 == 0:
@@ -2443,10 +2456,10 @@ class MotorControlApp(tk.Tk):
 
         def y_correct(direction, tag):
             self._log(
-                f"[SWEEP] Corrective Y {direction} shift ({y_corr_ms()}ms)")
+                f"[SWEEP] Corrective Y {direction} shift ({y_corr_mm():.2f} mm)")
             t_cmd = time.time()
-            move_actuator(direction, y_corr_ms(), y_speed, self._log)
-            self._wait_move_done(t_cmd, y_corr_ms() / 1000.0)
+            move_y_dir(direction, y_corr_mm(), self._log)
+            self._wait_move_done(t_cmd, axis="Y")
             time.sleep(0.5)
             save(tag)
 
@@ -2461,7 +2474,7 @@ class MotorControlApp(tk.Tk):
                       f"{self._last_x_cmd_mm:.2f} mm)")
             t_cmd = time.time()
             move_x(x_steps, 1, self._log)
-            self._wait_move_done(t_cmd)
+            self._wait_move_done(t_cmd, axis="X")
             time.sleep(0.5)
             save(f"{tag}_move")
             self._log("[SWEEP] Running AutoFocus after X move")
@@ -2569,8 +2582,7 @@ class MotorControlApp(tk.Tk):
             # Only the seek *speed* depends on this; the corner itself is found
             # from the boundary estimate, so a coarse step is safe and faster.
             x_steps = mm_to_x_steps(geo.x_step_mm if geo else 0.4)
-            y_speed = geo.y_speed if geo else 70
-            y_ms = int(round(1000 * (geo.y_time_s if geo else 1.2)))
+            y_mm = geo.y_step_mm if geo else 0.35
             set_speed(1000, self._log)
             time.sleep(0.2)
 
@@ -2580,7 +2592,7 @@ class MotorControlApp(tk.Tk):
                 self._log(f"[GSP] Moving X left (attempt {i})")
                 t_cmd = time.time()
                 move_x(x_steps, 0, self._log)
-                self._wait_move_done(t_cmd)
+                self._wait_move_done(t_cmd, axis="X")
                 time.sleep(0.5)
                 pct = self._boundary_pct()
                 if pct is not None:
@@ -2598,7 +2610,7 @@ class MotorControlApp(tk.Tk):
             self._log("[GSP] Step 2: Moving X right one time")
             t_cmd = time.time()
             move_x(x_steps, 1, self._log)
-            self._wait_move_done(t_cmd)
+            self._wait_move_done(t_cmd, axis="X")
             time.sleep(0.5)
 
             # Step 3: Y up until upper boundary > 20%
@@ -2606,8 +2618,8 @@ class MotorControlApp(tk.Tk):
             for i in range(1, 101):
                 self._log(f"[GSP] Moving Y up (attempt {i})")
                 t_cmd = time.time()
-                move_actuator("up", y_ms, y_speed, self._log)
-                self._wait_move_done(t_cmd, y_ms / 1000.0)
+                move_y_dir("up", y_mm, self._log)
+                self._wait_move_done(t_cmd, axis="Y")
                 time.sleep(0.5)
                 pct = self._boundary_pct(UPPER_BOUNDARY_THRESHOLD)
                 if pct is not None:
@@ -2624,8 +2636,8 @@ class MotorControlApp(tk.Tk):
             set_status("Moving down...")
             self._log("[GSP] Step 4: Moving Y down one time")
             t_cmd = time.time()
-            move_actuator("down", 1500, y_speed, self._log)
-            self._wait_move_done(t_cmd, 1.5)
+            move_y_dir("down", Y_CORRECTION_RATIO * y_mm, self._log)
+            self._wait_move_done(t_cmd, axis="Y")
             time.sleep(0.5)
 
             self._log("[GSP] ✓ Starting point reached!")
@@ -2739,9 +2751,23 @@ class MotorControlApp(tk.Tk):
         with self._frame_lock:
             return self._latest_frame_raw.copy() if self._latest_frame_raw is not None else None
 
+    def _wait_axis(self, axis: str) -> bool:
+        """Wait for a stepper move via the firmware's /status pulse counter;
+        fall back to visual stillness if /status cannot be read."""
+        if wait_idle(axis):
+            return True
+        self._log(f"[MOTION] {axis}: /status unavailable or timed out - "
+                  "falling back to visual feedback")
+        return self._wait_motion_stop()
+
     def _wait_move_done(self, t_cmd: float, expected_s: float = 0.0,
-                        start_timeout: float = 0.8, timeout_s: float = 10.0) -> bool:
+                        start_timeout: float = 0.8, timeout_s: float = 10.0,
+                        axis: str | None = None) -> bool:
         """Wait until a commanded move has actually happened *and* stopped.
+
+        With ``axis`` the firmware's /status pulse counter is authoritative
+        (the stepper firmware knows exactly when the last pulse went out); the
+        visual path below is only the fallback when /status cannot be read.
 
         ``_wait_motion_stop`` alone returns at once if the detector is still
         "still" from before the move - i.e. before the actuator has even
@@ -2755,6 +2781,11 @@ class MotorControlApp(tk.Tk):
         blocked), give the detector a moment to *see* motion if it has not yet,
         then wait for stillness.
         """
+        if axis is not None:
+            if wait_idle(axis):
+                return True
+            self._log(f"[MOTION] {axis}: /status unavailable or timed out - "
+                      "falling back to visual feedback")
         remaining = expected_s - (time.time() - t_cmd)
         if remaining > 0:
             time.sleep(remaining)
@@ -2824,7 +2855,7 @@ class MotorControlApp(tk.Tk):
         cmd_entry.bind("<Return>", lambda e: self._send_manual_cmd())
         self._make_btn(bar, "Send", self._send_manual_cmd).pack(side="left")
 
-        tk.Label(bar, text="e.g. /z?steps=800&dir=1",
+        tk.Label(bar, text="e.g. /z?steps=800&dir=1  (800 pulses = 1 mm)",
                  bg=C["surface"], fg=C["muted"], font=FONT_SMALL).pack(side="left", padx=8)
 
         self._cmd_resp_var = tk.StringVar(value="")

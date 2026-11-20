@@ -178,22 +178,22 @@ def test_suggestions():
     g.target_x_overlap = 0.50
 
     g.measured_y_px = 339.0
-    t = g.suggested_y_time(1080)
+    t = g.suggested_y_step_mm(1080)
     want = 1080 * 0.35
     check("Y pulse is scaled by want/measured",
-          near(t, 1.20 * want / 339.0, 1e-6), f"{t:.3f}")
+          near(t, 0.35 * want / 339.0, 1e-6), f"{t:.3f}")
     g.measured_y_px = 250.0            # wants +51 %, the cap must bite
-    t2 = g.suggested_y_time(1080)
+    t2 = g.suggested_y_step_mm(1080)
     check("one observation may not stretch the pulse by more than 25 %",
-          near(t2, 1.20 * 1.25, 1e-6), f"{t2:.3f}")
+          near(t2, 0.35 * 1.25, 1e-6), f"{t2:.3f}")
     # an already-correct step should not be moved
     g2 = sg.ScanGeometry()
     g2.measured_y_px = 1080 * 0.35
     check("a step that already hits the target is left alone",
-          near(g2.suggested_y_time(1080), 1.20, 1e-6),
-          f"{g2.suggested_y_time(1080)}")
+          near(g2.suggested_y_step_mm(1080), 0.35, 1e-6),
+          f"{g2.suggested_y_step_mm(1080)}")
     g3 = sg.ScanGeometry()
-    check("no measurement -> no suggestion", g3.suggested_y_time(1080) is None)
+    check("no measurement -> no suggestion", g3.suggested_y_step_mm(1080) is None)
     check("no px/mm -> no X suggestion", g3.suggested_x_step_mm(1920) is None)
 
 
@@ -203,16 +203,16 @@ def test_apply():
     g.measured_y_px = 100.0            # wildly off, so the cap must act
     g.frame_hw = FRAME
     changes = g.apply(FRAME)
-    check("apply reports what it changed", "y_time_s" in changes, str(changes))
+    check("apply reports what it changed", "y_step_mm" in changes, str(changes))
     check("a single correction is capped at max_adjust (25 %)",
-          near(g.y_time_s, 1.20 * 1.25, 1e-6), f"{g.y_time_s}")
-    check("the log carries (old, new)", changes["y_time_s"][0] == 1.20,
+          near(g.y_step_mm, 0.35 * 1.25, 1e-6), f"{g.y_step_mm}")
+    check("the log carries (old, new)", changes["y_step_mm"][0] == 0.35,
           str(changes))
 
     g2 = sg.ScanGeometry(auto_tune=False)
     g2.measured_y_px = 100.0
     check("auto_tune off -> nothing changes", g2.apply(FRAME) == {})
-    check("...and the command is untouched", near(g2.y_time_s, 1.20))
+    check("...and the command is untouched", near(g2.y_step_mm, 0.35))
 
     g3 = sg.ScanGeometry()
     g3.px_per_mm = 1130.0
@@ -280,8 +280,10 @@ def test_roundtrip():
           near(h.px_per_mm, g.px_per_mm))
     check("targets survive", near(h.target_y_overlap, 0.60))
     check("unknown keys are ignored (forward compatible)",
-          sg.ScanGeometry.from_dict({"y_time_s": 1.5, "whatever": 3}).y_time_s
-          == 1.5)
+          sg.ScanGeometry.from_dict({"y_step_mm": 0.5, "whatever": 3}).y_step_mm
+          == 0.5)
+    check("an old timed-actuator calibration is migrated to mm",
+          near(sg.ScanGeometry.from_dict({"y_time_s": 1.20}).y_step_mm, 0.35))
 
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "scan_geometry.json")

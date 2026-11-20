@@ -1,7 +1,7 @@
 """Tuning knobs for the live (on-the-fly) blade stitcher.
 
 Every threshold here is either measured from the production scans in
-``image_stitching/from_scratch/test_images`` or has a comment explaining what
+``main_code/blade_images/test_images`` or has a comment explaining what
 it guards against.  Values are deliberately conservative: it is far cheaper to
 reject one extra frame than to blend a bad transform into a defect mosaic.
 """

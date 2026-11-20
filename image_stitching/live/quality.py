@@ -2,7 +2,7 @@
 
 Why not ``cv2.Laplacian(...).var()`` (what most examples use)?
 
-Measured on the real scans in ``from_scratch/test_images``: two consecutive
+Measured on the real scans in ``main_code/blade_images/test_images``: two consecutive
 frames where one is visibly out of focus and the next is sharp both score a
 Laplacian variance of 13-14, because the dark vignette and the slowly varying
 blade surface dominate the statistic.  The absolute number is also useless for

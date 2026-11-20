@@ -12,7 +12,7 @@ Two sources are supported:
 Examples::
 
     # replay a recorded scan, keeping only usable frames
-    python run_live.py --replay ../from_scratch/test_images --out runs/col01
+    python run_live.py --replay ../../main_code/blade_images/test_images --out runs/col01
 
     # live camera, 1 s settle time, partial mosaic every 5 frames
     python run_live.py --camera 1 --out runs/live --settle 1.0 --flush-every 5

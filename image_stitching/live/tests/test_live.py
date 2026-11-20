@@ -11,7 +11,7 @@ The synthetic tests pin down the behaviours that the recorded scans exposed;
 * holes being filled by soft frames without overwriting good pixels,
 * the session surviving a frame the pipeline cannot process.
 
-The optional real-data tests use ``from_scratch/test_images`` when present and
+The optional real-data tests use ``main_code/blade_images/test_images`` when present and
 are skipped otherwise.
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ from live.pipeline import LiveStitcher                                  # noqa: 
 from live.quality import assess_intrinsic, sharpness                    # noqa: E402
 from live.registration import Registrar                                 # noqa: E402
 
-SCAN_DIR = ROOT / "from_scratch" / "test_images"
+SCAN_DIR = ROOT.parent / "main_code" / "blade_images" / "test_images"
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

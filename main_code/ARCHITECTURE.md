@@ -187,9 +187,9 @@ config.py       LiveConfig: every tunable, with defaults that matter
 run_live.py     replay a folder through the pipeline (no hardware)
 ```
 
-Why it is not `cv2.Stitcher_create()`: the file
-`image_stitching/using_opencv_funcn/balde_stitch_inbuilt_funcn.py` is that
-attempt, kept as a record. OpenCV's stitcher assumes *features* (SIFT/ORB) and
+Why it is not `cv2.Stitcher_create()`: the earlier
+`image_stitching/using_opencv_funcn/balde_stitch_inbuilt_funcn.py` was that
+attempt (removed; it is in the git history). OpenCV's stitcher assumes *features* (SIFT/ORB) and
 *rotational* camera motion. A blade at 100x has almost no features, and the
 motion is a pure translation of a few hundred pixels - roughly 99 % of the frame
 is identical between neighbours. Phase correlation on a high-passed image is
@@ -336,18 +336,20 @@ suite runnable there is worth more than the framework.
 
 ---
 
-## 10. Legacy: `image_stitching/from_scratch/` [nuance]
+## 10. Recorded scans: `sample_scans/` [nuance]
 
-`blade_stitch.py` (209 lines: `scan_order`, `gray_small`, `estimate`, `compose`)
-is the first attempt: name-sorted order, phase correlation against the previous
-frame only, paste with a soft edge. It is kept for two reasons:
+`test_images/` (207 frames), `scan_20261103_203842/` (176 frames) and
+`scan_20261021_214947/` (80 frames) are **real recorded scans**. Every number in
+`SWEEP_GEOMETRY.md` and every "measured" constant in this repo was derived from
+them; without the frames none of the calibration could be re-derived or
+regression-tested. They used to sit, duplicated, in `image_stitching/from_scratch/`
+and `image_stitching/using_opencv_funcn/`; one copy of each now lives here.
 
-* `test_images/` (207 frames) and `scan_20261103_203842/` (176 frames) are **real
-  recorded scans**. Every number in `SWEEP_GEOMETRY.md` and every "measured"
-  constant in this repo was derived from them. Without the frames, none of the
-  calibration could be re-derived or regression-tested.
-* It shows *why* the current pipeline looks like it does: chained pairwise
-  registration drifts, so the next version solved globally.
+The first stitcher, `from_scratch/blade_stitch.py` (name-sorted order, phase
+correlation against the previous frame only, paste with a soft edge), was
+removed; it is in the git history. It is *why* the current pipeline looks like
+it does: chained pairwise registration drifts, so the next version solved
+globally.
 
 ---
 

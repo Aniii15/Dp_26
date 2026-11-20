@@ -6,7 +6,7 @@ machine that runs this has a spare Python and nothing else:
     python test_scan_geometry.py
 
 Every number used here is measured, not invented: the Y samples and the X step
-come from the two recorded scans in ``image_stitching/from_scratch`` (1920x1080
+come from the two recorded scans in ``sample_scans/`` (1920x1080
 frames), so a failure means the geometry maths no longer agrees with the data
 the rig actually produced.
 """

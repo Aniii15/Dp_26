@@ -36,6 +36,7 @@ import cv2
 import numpy as np
 
 from .config import LiveConfig
+from .lens import default_lens
 from .mosaic import AddResult, IncrementalMosaic
 from .quality import QualityReport, assess_intrinsic, focus_ratio
 from .registration import Registrar, Registration
@@ -136,6 +137,7 @@ class LiveStitcher:
         self._pending = 0
         self._canvas_warned = False
         self._last_abs_sharpness = 0.0
+        self._valid_cache: dict = {}
         self._kept_dir = Path(save_kept_dir) if save_kept_dir else None
         self._rej_dir = Path(save_rejected_dir) if save_rejected_dir else None
         Path(self.prefix).parent.mkdir(parents=True, exist_ok=True)
@@ -214,7 +216,7 @@ class LiveStitcher:
                 return d
 
         token = tag
-        self.registrar.prepare(token, frame)
+        self.registrar.prepare(token, frame, valid=self._lens_valid(frame))
 
         # ── 2. first frame becomes the origin ───────────────────────────────
         if not self.nodes:
@@ -237,7 +239,7 @@ class LiveStitcher:
             scale = self.registrar.scale(node.token)
             r = self.registrar.register(node.token, token,
                                         None if prior is None else prior * scale)
-            if r is None or r.ncc < cfg.min_ncc or r.overlap < cfg.min_overlap:
+            if not self._usable(r):
                 continue
             results.append((node, r))
 
@@ -247,10 +249,32 @@ class LiveStitcher:
             # already placed for the nearest ones and retry.
             for node in self._nearest_nodes(prior):
                 r = self.registrar.register(node.token, token, None)
-                if r is not None and r.ncc >= cfg.min_ncc and r.overlap >= cfg.min_overlap:
+                if self._usable(r):
                     results.append((node, r))
                 if results:
                     break
+
+        if not results and cfg.dead_reckon and prior is not None and self.nodes:
+            # No image link, but the machine knows roughly where it went.
+            # Place it there as a flagged hole-filler: it never overwrites
+            # registered imagery, it never starts a separate band, and the
+            # global stitch re-registers it properly after the scan.
+            pose = self.nodes[-1].pose.copy()
+            pose[:2, 2] += prior
+            d.pose = pose
+            res = self._safe_add(frame, pose, empty_only=True, low_quality=True)
+            if res is None:
+                d.reason = "canvas_full"
+                d.ms = (time.perf_counter() - t0) * 1000
+                return d
+            self._accept(d, token, pose, frame.shape[:2], res)
+            d.status = "filled"
+            d.method = "dead_reckoned"
+            d.reason = f"dead_reckoned(x{abs_ratio:.2f})"
+            d.sharp_ratio = abs_ratio
+            d.ms = (time.perf_counter() - t0) * 1000
+            self._maybe_flush()
+            return d
 
         if not results and abs_ratio < cfg.soft_unregisterable_ratio:
             # Soft frame that also failed to match: this is a capture fault,
@@ -611,6 +635,20 @@ class LiveStitcher:
         fused[:2, 2] = sum(w * p[:2, 2] for w, p in zip(weights, poses))
         return fused
 
+    def _usable(self, r: Registration | None) -> bool:
+        cfg = self.cfg
+        return (r is not None and r.ncc >= cfg.min_ncc and r.overlap >= cfg.min_overlap
+                and r.ncc_hp >= getattr(cfg, "min_ncc_hp", 0.0))
+
+    def _lens_valid(self, frame: np.ndarray) -> np.ndarray | None:
+        frac = getattr(self.cfg, "lens_radius_frac", 0.0)
+        if not frac:
+            return None
+        key = frame.shape[:2]
+        if key not in self._valid_cache:
+            self._valid_cache[key] = default_lens(key[0], key[1], frac).valid
+        return self._valid_cache[key]
+
     def _sharpness_ratio(self, node: Node, token: str, reg: Registration) -> float:
         prev_work = self.registrar.work_gray(node.token)
         cur_work = self.registrar.work_gray(token)
@@ -618,8 +656,12 @@ class LiveStitcher:
             return 1.0
         h, w = prev_work.shape[:2]
         warped = cv2.warpAffine(cur_work, reg.affine, (w, h), flags=cv2.INTER_LINEAR)
-        mask = cv2.warpAffine(np.ones(cur_work.shape, np.uint8), reg.affine,
-                              (w, h), flags=cv2.INTER_NEAREST) > 0
+        vc = self.registrar._valid.get(token)
+        vp = self.registrar._valid.get(node.token)
+        src = np.ones(cur_work.shape, np.uint8) if vc is None else vc
+        mask = cv2.warpAffine(src, reg.affine, (w, h), flags=cv2.INTER_NEAREST) > 0
+        if vp is not None:
+            mask &= vp > 0
         return focus_ratio(warped, prev_work, mask)
 
     def _trim_cache(self) -> None:
@@ -706,7 +748,8 @@ class LiveStitcher:
                      if (d.reason or "").split("(")[0] not in faults]
         missing = [d for d in bad if (d.reason or "").split("(")[0] in faults]
         if redundant:
-            lines += ["", f"Redundant frames - safe to delete ({len(redundant)}):"]
+            lines += ["", f"Not blended in the live preview ({len(redundant)}) - "
+                          "kept on disk; the global stitch after the scan uses them:"]
             for d in redundant:
                 lines.append(f"  {d.tag:44s} {d.reason}")
         if missing:

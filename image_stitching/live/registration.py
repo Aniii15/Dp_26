@@ -50,6 +50,13 @@ class Registration:
     matches: int
     method: str
     prior_ok: bool = True
+    ncc_hp: float = 0.0
+    """NCC of the *band-passed* images over the overlap.  Plain NCC is
+    dominated by vignetting and the slow brightness gradient of the blade:
+    measured on scan_20261105_200702, a registration deliberately shifted by
+    77 px still scores plain NCC 0.90 (median), while its band-passed NCC is
+    <= 0.07 (p90).  Correct matches score 0.36-0.85 (median).  This is the
+    number that actually says whether a registration is right."""
 
     @property
     def shift(self) -> np.ndarray:
@@ -64,7 +71,13 @@ class Registration:
 
     @property
     def score(self) -> float:
-        return float(self.ncc) * float(min(1.0, self.inliers / 200.0))
+        q = self.ncc_hp if self.ncc_hp > 0 else self.ncc
+        return float(q) * float(min(1.0, self.inliers / 200.0))
+
+
+def highpass(img: np.ndarray, sigma: float = 6.0) -> np.ndarray:
+    f = img.astype(np.float32)
+    return f - cv2.GaussianBlur(f, (0, 0), sigma)
 
 
 class Registrar:
@@ -86,10 +99,19 @@ class Registrar:
         self._feat: dict[str, tuple] = {}
         self._gray: dict[str, np.ndarray] = {}
         self._scale: dict[str, float] = {}
+        self._valid: dict[str, np.ndarray] = {}
 
     # ── preparation ─────────────────────────────────────────────────────────
-    def prepare(self, token: str, frame: np.ndarray) -> np.ndarray:
-        """Scale a full-resolution frame to work size and cache features."""
+    def prepare(self, token: str, frame: np.ndarray,
+                valid: np.ndarray | None = None) -> np.ndarray:
+        """Scale a full-resolution frame to work size and cache features.
+
+        ``valid`` is an optional full-resolution 0..1 map of pixels that are
+        real image (see ``lens.py``).  Without it the black, optically clipped
+        frame corners take part in matching: their curved edge is a strong,
+        *static* feature that matches itself at zero displacement in every
+        pair, and the black area inflates the NCC check.
+        """
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         scale = self.cfg.work_width / gray.shape[1]
         if scale < 1.0:
@@ -100,8 +122,17 @@ class Registrar:
             work = gray
         self._gray[token] = work
         self._scale[token] = scale
+        vmask = None
+        if valid is not None:
+            v = cv2.resize(np.asarray(valid, np.float32),
+                           (work.shape[1], work.shape[0]),
+                           interpolation=cv2.INTER_AREA)
+            vmask = (v > 0.98).astype(np.uint8)
+            # keep descriptors well away from the optical edge
+            vmask = cv2.erode(vmask, np.ones((9, 9), np.uint8))
+            self._valid[token] = vmask
         if token not in self._feat:
-            self._feat[token] = self._det.detectAndCompute(work, None)
+            self._feat[token] = self._det.detectAndCompute(work, vmask)
         return work
 
     def forget(self, tokens) -> None:
@@ -109,6 +140,7 @@ class Registrar:
             self._feat.pop(t, None)
             self._gray.pop(t, None)
             self._scale.pop(t, None)
+            self._valid.pop(t, None)
 
     def work_gray(self, token: str) -> np.ndarray | None:
         return self._gray.get(token)
@@ -182,32 +214,38 @@ class Registrar:
 
         h, w = a.shape[:2]
         max_step = self.cfg.max_step_frac * max(h, w)
-        best = None                       # (ncc, method, model, overlap, inliers)
+        va, vb = self._valid.get(prev_token), self._valid.get(cur_token)
+        ha, hb = highpass(a), highpass(b)
+        best = None                       # (hp, method, model, overlap, inliers, ncc)
         for model, inl_n, method, d_pred in candidates:
             if np.linalg.norm(model[:, 2]) > max_step:
                 continue                  # physically impossible for one step
-            ncc, overlap = self._verify(a, b, model)
-            if best is None or self._better(ncc, model, d_pred, best):
-                best = (ncc, method, model, overlap, inl_n)
+            ncc, overlap = self._verify(a, b, model, va, vb)
+            hp, _ = self._verify(ha, hb, model, va, vb, centered=True)
+            if best is None or self._better(hp, model, d_pred, best):
+                best = (hp, method, model, overlap, inl_n, ncc)
         if best is None:
             return None
-        ncc, method, model, overlap, inl_n = best
+        hp, method, model, overlap, inl_n, ncc = best
 
-        # Optional sub-pixel polish, kept only when it improves the NCC.
+        # Optional sub-pixel polish, kept only when it improves the match.
         if ncc < self.cfg.polish_below_ncc:
             refined = self._polish(a, b, model)
             if refined is not None:
-                ncc2, overlap2 = self._verify(a, b, refined)
-                if ncc2 > ncc + 0.005:
-                    model, ncc, overlap, method = refined, ncc2, overlap2, method + "+ecc"
+                hp2, overlap2 = self._verify(ha, hb, refined, va, vb, centered=True)
+                if hp2 > hp + 0.01:
+                    ncc2, _ = self._verify(a, b, refined, va, vb)
+                    model, ncc, hp, overlap, method = (refined, ncc2, hp2, overlap2,
+                                                       method + "+ecc")
 
         return Registration(model, self._scale.get(prev_token, 1.0), ncc, overlap,
-                            inl_n, n_matches, method, prior is not None)
+                            inl_n, n_matches, method, prior is not None, hp)
 
     def _better(self, ncc: float, model: np.ndarray, pred: np.ndarray | None,
                 best) -> bool:
-        """Rank candidates. NCC first; on a near-tie prefer the commanded motion."""
-        best_ncc, _, best_model, _, _ = best
+        """Rank candidates by band-passed NCC; on a near-tie prefer the
+        commanded motion."""
+        best_ncc, _, best_model = best[0], best[1], best[2]
         if ncc > best_ncc + 0.02:
             return True
         if pred is not None and abs(ncc - best_ncc) <= 0.02:
@@ -251,11 +289,13 @@ class Registrar:
         out[:, 2] /= k
         return out
 
-    def _verify(self, a, b, model):
+    def _verify(self, a, b, model, va=None, vb=None, centered=False):
         h, w = a.shape[:2]
         warped = cv2.warpAffine(b, model, (w, h), flags=cv2.INTER_LINEAR)
-        mask = cv2.warpAffine(np.ones(b.shape, np.uint8), model, (w, h),
-                              flags=cv2.INTER_NEAREST) > 0
+        src = np.ones(b.shape, np.uint8) if vb is None else vb
+        mask = cv2.warpAffine(src, model, (w, h), flags=cv2.INTER_NEAREST) > 0
+        if va is not None:
+            mask &= va > 0
         overlap = float(mask.mean())
         m = cv2.erode(mask.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
         if m.sum() < 2000:
@@ -264,5 +304,8 @@ class Registrar:
         y = a[m].astype(np.float64)
         if x.std() < 1e-3 or y.std() < 1e-3:
             return 0.0, overlap
-        ncc = float(np.corrcoef(x, y)[0, 1])
+        if centered:          # band-passed input: zero-mean by construction
+            ncc = float((x * y).sum() / np.sqrt((x * x).sum() * (y * y).sum()))
+        else:
+            ncc = float(np.corrcoef(x, y)[0, 1])
         return (ncc if np.isfinite(ncc) else 0.0), overlap

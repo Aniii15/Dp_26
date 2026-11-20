@@ -69,6 +69,12 @@ class LiveConfig:
     max_disconnected_bands: int = 8
     """If parking is enabled, stop after this many bands."""
 
+    dead_reckon: bool = True
+    """A frame that cannot be registered is placed where the motion model says
+    it is (last pose + predicted step) and blended as a flagged hole-filler,
+    instead of being dropped or parked in a separate band.  Nothing is lost:
+    the global stitch after the scan re-registers every frame anyway."""
+
     soft_unregisterable_ratio: float = 0.65
     """If a frame fails to register *and* is this much softer than the last
     accepted frame, it is a capture fault: drop it instead of starting a new
@@ -78,9 +84,13 @@ class LiveConfig:
     min_ncc: float = 0.55
     """Photometric correlation of the warped frame with its neighbour.
 
-    Correct adjacent pairs measure 0.74-0.99 here (0.74 at ~13% overlap), while
-    wrong models land near 0.3.  0.55 keeps the tightest legitimate overlaps and
-    rejects the rest."""
+    Correct adjacent pairs measure 0.74-0.99 here (0.74 at ~13% overlap).
+    Caveat measured later: on this surface a model that is *wrong by 77 px*
+    still scores ~0.90, because vignetting and the slow brightness gradient
+    dominate plain NCC.  ``min_ncc_hp`` is the gate that actually works."""
+    min_ncc_hp: float = 0.15
+    """Band-passed NCC (``Registration.ncc_hp``) a registration must reach.
+    Wrong models score <= 0.07 (p90), right ones 0.36-0.85 (median)."""
     min_new_area: float = 0.10
     """A frame covering <10% uncovered area is a duplicate (stalled motor)."""
     max_step_frac: float = 0.85
@@ -151,7 +161,13 @@ class LiveConfig:
     'disconnected' bands."""
 
     # ── Blending ────────────────────────────────────────────────────────────
-    feather_px: int = 64
+    feather_px: int = 160
+    """Blend ramp at frame edges.  64 px made every frame edge a visible step
+    whenever its neighbour had a lower focus weight."""
+    lens_radius_frac: float = 0.56
+    """Image-circle radius as a fraction of the frame width (0 = no lens mask).
+    The top-right and bottom-right corners of this camera are black in every
+    frame; without the mask they were blended as dark wedges."""
     exposure_gain_clip: tuple[float, float] = (0.75, 1.35)
     output_scale: float = 1.0
     """Scale of the saved mosaic (0.5 halves memory 4x for live previews)."""

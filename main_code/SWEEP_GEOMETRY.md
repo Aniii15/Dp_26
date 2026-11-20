@@ -23,7 +23,7 @@ rig, and why the code now measures instead of assuming.
 ## 1. What the constants actually do
 
 Measured with the same registrar the live stitcher uses (`Registrar.register`),
-on the two recorded scans in `image_stitching/from_scratch` (1920x1080 frames):
+on the two recorded scans in `sample_scans/` (1920x1080 frames):
 
 ### Y axis - fixed 1200 ms pulse
 

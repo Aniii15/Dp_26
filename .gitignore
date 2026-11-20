@@ -6,7 +6,6 @@ main_code/blade_mosaic/
 main_code/blade_images/
 image_stitching/**/_kept/
 image_stitching/**/_rejected/
-image_stitching/**/purge_report.csv
 *.pyc
 
 poster/assets/_[a-z]*.png

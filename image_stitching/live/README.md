@@ -63,7 +63,7 @@ Results (every frame used, nothing dropped):
 | scan | frames | image links | placed by motion model only | time |
 |---|---|---|---|---|
 | `scan_20261105_200702` | 156 | 1083 | 4 (hopelessly blurred) | ~2.5 min |
-| `from_scratch/test_images` (old batch stitcher: crash after 16 min) | 207 | 1122 | 0 | 3.5 min |
+| `test_images` (old batch stitcher: crash after 16 min) | 207 | 1122 | 0 | 3.5 min |
 | `scan_20261030_200028` | 338 | 2423 | 0 | 6.3 min |
 
 Outputs (`<prefix>_...`): `mosaic.jpg/.png`, `coverage.png`, `sources.png`
@@ -89,8 +89,9 @@ Known limits:
 
 ## 1. What the current flow actually costs (measured on this repo's data)
 
-All numbers below come from `image_stitching/from_scratch/test_images`
+All numbers below come from `sample_scans/test_images`
 (3 columns, 207 frames, 1920×1080) with the code in this repository.
+`blade_stitch.py` was the earlier batch stitcher; it has since been removed.
 
 | Finding | Measurement | Consequence |
 |---|---|---|
@@ -192,36 +193,24 @@ becomes a separate mosaic.
 
 ---
 
-## 3. What to delete (and how)
+## 3. Frames are never deleted
 
-> **By default: nothing.** The GUI never deletes raw sweep frames, and the
-> global stitch uses all of them - a frame the live preview rejected is often
-> the only sharp view of some spot. The tools below are for auditing.
+Raw sweep frames are kept, and the global stitch uses all of them - a frame
+the live preview rejected is often the only sharp view of some spot. (The
+earlier `purge.py`, which flagged and deleted "redundant" frames, has been
+removed for that reason.)
 
-Two tools, same criteria:
+To audit what the live preview would accept, replay a scan:
 
 ```bash
-# online: run_live.py copies accepted frames to <out>_kept/ and rejected ones
-# to <out>_rejected/<reason>__<name>.jpg for audit
-python live/run_live.py --replay ../from_scratch/test_images --out runs/col01
-
-# offline audit of an existing folder (dry run by default - deletes nothing)
-python live/purge.py ../from_scratch/test_images
-python live/purge.py ../from_scratch/test_images --move-to ../_trash   # or --delete
-python live/purge.py ../from_scratch/test_images --drop-af            # + AF frames
+# copies accepted frames to <out>_kept/ and rejected ones to
+# <out>_rejected/<reason>__<name>.jpg - the scan folder itself is untouched
+python live/run_live.py --replay ../sample_scans/test_images --out runs/col01
 ```
-
-Verdicts: `unreadable`, `underexposed`, `overexposed`, `no_contrast`,
-`soft(ratio=…)`, `unmatchable`, `duplicate_of:<frame>`,
-`autofocus_reference` (with `--drop-af`).
-
-On the sample data the dry run flags **19 of 207** frames (7 unmatchable
-defocused frames in `col02`, 8 soft frames, 4 duplicates) and touches nothing.
-Every verdict, with its metrics, lands in `purge_report.csv`.
 
 > Blur thresholds are per-pair, not absolute. Do not lower `--blur-ratio` below
 > ~0.6: the p5 of frame-to-frame sharpness in this data is 0.58 from
-> illumination drift alone, and you would start deleting good frames.
+> illumination drift alone.
 
 ---
 
@@ -233,7 +222,7 @@ Every verdict, with its metrics, lands in `purge_report.csv`.
 cd image_stitching
 
 # replay a finished scan, keeping only usable frames
-python live/run_live.py --replay from_scratch/test_images --pattern 'col01_*' \
+python live/run_live.py --replay ../sample_scans/test_images --pattern 'col01_*' \
        --out runs/col01 --flush-every 0
 
 # live capture card; submit only when the scene has been still for 0.8 s

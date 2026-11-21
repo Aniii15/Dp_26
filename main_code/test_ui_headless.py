@@ -599,7 +599,7 @@ def main() -> int:
 
         # recalibrate restores the defaults
         app._scan_geo_reset()
-        assert abs(app._scan_geo.x_step_mm - 0.40) < 1e-9, app._scan_geo.x_step_mm
+        assert abs(app._scan_geo.x_step_mm - 1.20) < 1e-9, app._scan_geo.x_step_mm
         assert app.sg_y_step.get() == "0.35", app.sg_y_step.get()
     check("SCAN GEOMETRY panel + live/global calibration loop", scan_geometry)
 

@@ -75,6 +75,10 @@ Y_CORRECTION_RATIO = 1.25   # corrective / back-off Y move vs. a sweep move
 Y_DIR = {"down": 0, "up": 1}
 MOVE_TIMEOUT_S = 30.0       # longest wait for a queued move to finish
 SWEEP_SPEED_US_DEFAULT = 1000   # sweep step half-period: 1000 us = 500 Hz
+# Go to Starting Point seeks the corner in bigger Y steps than the sweep uses:
+# up = 3 x y_step_mm (1.05 mm at the 0.35 mm default), back down = 3 x the
+# corrective move (1.3125 mm).
+GSP_Y_FACTOR = 3
 # The new X stepper wiring runs opposite to the old one: invert the DIR level so
 # "right" (+X) in the sweep, go-to-start and manual buttons is right again.
 X_DIR_INVERT = True
@@ -1509,14 +1513,15 @@ class MotorControlApp(tk.Tk):
     # ── Sweep motor speed ─────────────────────────────────────────────────────
 
     def _build_sweep_speed_panel(self, parent):
-        """Pulse rate used by every X/Y/Z move of the sweep (AF Z moves too).
+        """Pulse rate used by every X/Y/Z move of the sweep, Go to Starting
+        Point and the Auto-Focus button.
 
         The value is the firmware's step *half*-period: 1000 µs = 500 Hz.
-        It is sent when a sweep starts, and "Apply now" changes it mid-sweep;
-        the move already in progress finishes at the old rate."""
-        card = self._card(parent, "SWEEP MOTOR SPEED", C["accent"],
-                          "half-period per pulse, lower = faster; applies to "
-                          "X, Y and Z (autofocus) moves")
+        It is sent when any of those starts, and "Apply now" changes it
+        mid-run; the move already in progress finishes at the old rate."""
+        card = self._card(parent, "MOTOR SPEED", C["accent"],
+                          "half-period per pulse, lower = faster; used by the "
+                          "sweep, go-to-start and autofocus")
         self._sweep_speed_us = tk.IntVar(value=SWEEP_SPEED_US_DEFAULT)
         self._sweep_speed_info = tk.StringVar()
         self._sweep_speed_applied = tk.StringVar(value="")
@@ -1554,6 +1559,13 @@ class MotorControlApp(tk.Tk):
         warn = "   ⚠ fast, no accel ramp" if hz > 2000 else ""
         self._sweep_speed_info.set(
             f"{hz:,.0f} Hz · {mm_s:.3f} mm/s · {rpm:.1f} RPM{warn}")
+
+    def _send_motor_speed(self, us: int, tag: str):
+        """Send the selected speed from a worker thread (value read on Tk)."""
+        self._log(f"[{tag}] motor speed {us} µs half-period "
+                  f"({1e6 / (2 * us):,.0f} Hz)")
+        set_speed(us, self._log)
+        time.sleep(0.2)
 
     def _apply_sweep_speed(self):
         us = self._sweep_speed_value()
@@ -1883,11 +1895,14 @@ class MotorControlApp(tk.Tk):
         except ValueError:
             self._log("[AF] Invalid auto-focus parameters.")
             return
+        speed_us = self._sweep_speed_value()      # read on the Tk thread
+        self._sweep_speed_applied.set(f"sent {speed_us} µs")
 
         def worker():
             self._post(lambda: self.btn_af.configure(
                 state="disabled", text="⏳ Focusing..."))
             try:
+                self._send_motor_speed(speed_us, "AF")
                 self._autofocus(steps, delay)
             finally:
                 self._post(lambda: self.btn_af.configure(
@@ -2641,6 +2656,9 @@ class MotorControlApp(tk.Tk):
         self._log("[GSP] Starting Go to Starting Point routine")
         self.btn_go_start.configure(state="disabled", text="⏳ Calibrating...")
         self._gsp_status.set("Calibrating...")
+        # read on the Tk thread: the worker must never touch a Tk variable
+        self._gsp_speed_us = self._sweep_speed_value()
+        self._sweep_speed_applied.set(f"sent {self._gsp_speed_us} µs")
         threading.Thread(target=self._gsp_worker, daemon=True).start()
 
     def _gsp_worker(self):
@@ -2654,8 +2672,8 @@ class MotorControlApp(tk.Tk):
             # from the boundary estimate, so a coarse step is safe and faster.
             x_steps = mm_to_x_steps(geo.x_step_mm if geo else X_STEP_MM_DEFAULT)
             y_mm = geo.y_step_mm if geo else 0.35
-            set_speed(1000, self._log)
-            time.sleep(0.2)
+            self._send_motor_speed(
+                getattr(self, "_gsp_speed_us", SWEEP_SPEED_US_DEFAULT), "GSP")
 
             # Step 1: X left until left boundary > 20%
             set_status("Moving left...")
@@ -2689,7 +2707,7 @@ class MotorControlApp(tk.Tk):
             for i in range(1, 101):
                 self._log(f"[GSP] Moving Y up (attempt {i})")
                 t_cmd = time.time()
-                move_y_dir("up", y_mm, self._log)
+                move_y_dir("up", GSP_Y_FACTOR * y_mm, self._log)
                 self._wait_move_done(t_cmd, axis="Y")
                 time.sleep(0.5)
                 pct = self._boundary_pct(UPPER_BOUNDARY_THRESHOLD)
@@ -2707,7 +2725,7 @@ class MotorControlApp(tk.Tk):
             set_status("Moving down...")
             self._log("[GSP] Step 4: Moving Y down one time")
             t_cmd = time.time()
-            move_y_dir("down", Y_CORRECTION_RATIO * y_mm, self._log)
+            move_y_dir("down", GSP_Y_FACTOR * Y_CORRECTION_RATIO * y_mm, self._log)
             self._wait_move_done(t_cmd, axis="Y")
             time.sleep(0.5)
 

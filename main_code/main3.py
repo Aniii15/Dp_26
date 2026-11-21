@@ -75,6 +75,10 @@ Y_CORRECTION_RATIO = 1.25   # corrective / back-off Y move vs. a sweep move
 Y_DIR = {"down": 0, "up": 1}
 MOVE_TIMEOUT_S = 30.0       # longest wait for a queued move to finish
 SWEEP_SPEED_US_DEFAULT = 1000   # sweep step half-period: 1000 us = 500 Hz
+# The new X stepper wiring runs opposite to the old one: invert the DIR level so
+# "right" (+X) in the sweep, go-to-start and manual buttons is right again.
+X_DIR_INVERT = True
+X_STEP_MM_DEFAULT = 1.2   # X column advance / GSP step (was 0.4 mm = 320 pulses)
 R_STEPS_PER_REV = 1600
 DEGREES_PER_STEP = 360 / R_STEPS_PER_REV
 
@@ -233,6 +237,9 @@ def move_z(steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
 
 
 def move_x(steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
+    """``direction`` 1 = right (+X), 0 = left; X_DIR_INVERT maps it to the pin."""
+    if X_DIR_INVERT:
+        direction = 0 if direction else 1
     return http_get("/x", {"steps": steps, "dir": direction}, log_fn)
 
 
@@ -1236,7 +1243,7 @@ class MotorControlApp(tk.Tk):
             geo = _scan_geometry.ScanGeometry()
         self._scan_geo = geo
         self._frame_shape = None          # set from the first saved frame
-        self._last_x_cmd_mm = geo.x_step_mm if geo else 0.4
+        self._last_x_cmd_mm = geo.x_step_mm if geo else X_STEP_MM_DEFAULT
         self._prev_capture_tag = None
         self._last_sweep_scan_dir = None
         return geo
@@ -1264,7 +1271,7 @@ class MotorControlApp(tk.Tk):
                      font=FONT_SMALL).pack(side="left", padx=4)
 
         self.sg_y_step = tk.StringVar(value=f"{geo.y_step_mm:.2f}" if geo else "0.35")
-        self.sg_x_step = tk.StringVar(value=f"{geo.x_step_mm:.2f}" if geo else "0.40")
+        self.sg_x_step = tk.StringVar(value=f"{geo.x_step_mm:.2f}" if geo else f"{X_STEP_MM_DEFAULT:.2f}")
         self.sg_y_overlap = tk.StringVar(
             value=f"{int(round(100 * geo.target_y_overlap))}" if geo else "65")
         self.sg_x_overlap = tk.StringVar(
@@ -1353,7 +1360,7 @@ class MotorControlApp(tk.Tk):
             return
         self._scan_geo = _scan_geometry.ScanGeometry()
         for var, val in ((self.sg_y_step, "0.35"),
-                         (self.sg_x_step, "0.40"), (self.sg_y_overlap, "65"),
+                         (self.sg_x_step, f"{X_STEP_MM_DEFAULT:.2f}"), (self.sg_y_overlap, "65"),
                          (self.sg_x_overlap, "50")):
             var.set(val)
         self.sg_auto.set(True)
@@ -2403,7 +2410,7 @@ class MotorControlApp(tk.Tk):
         geo = getattr(self, "_scan_geo", None)
         if geo is not None and not geo.frame_hw and self._frame_shape:
             geo.frame_hw = tuple(self._frame_shape)
-        x_steps = mm_to_x_steps(geo.x_step_mm if geo else 0.4)
+        x_steps = mm_to_x_steps(geo.x_step_mm if geo else X_STEP_MM_DEFAULT)
         max_y_moves = 100
         self._last_sweep_scan_dir = images_dir
         self._log(f"[SWEEP] geometry: {geo.describe() if geo else 'defaults'}")
@@ -2530,10 +2537,10 @@ class MotorControlApp(tk.Tk):
         def x_advance(tag):
             """Move X right + autofocus. True when the right boundary is reached."""
             nonlocal x_steps
-            x_steps = mm_to_x_steps(geo.x_step_mm if geo else 0.4)
+            x_steps = mm_to_x_steps(geo.x_step_mm if geo else X_STEP_MM_DEFAULT)
             # Remember the command: the measured displacement of the frames that
             # follow is what calibrates px/mm, so it has to be attributable.
-            self._last_x_cmd_mm = geo.x_step_mm if geo else 0.4
+            self._last_x_cmd_mm = geo.x_step_mm if geo else X_STEP_MM_DEFAULT
             self._log(f"[SWEEP] Moving X right ({x_steps} steps = "
                       f"{self._last_x_cmd_mm:.2f} mm)")
             t_cmd = time.time()
@@ -2645,7 +2652,7 @@ class MotorControlApp(tk.Tk):
             geo = getattr(self, "_scan_geo", None)
             # Only the seek *speed* depends on this; the corner itself is found
             # from the boundary estimate, so a coarse step is safe and faster.
-            x_steps = mm_to_x_steps(geo.x_step_mm if geo else 0.4)
+            x_steps = mm_to_x_steps(geo.x_step_mm if geo else X_STEP_MM_DEFAULT)
             y_mm = geo.y_step_mm if geo else 0.35
             set_speed(1000, self._log)
             time.sleep(0.2)

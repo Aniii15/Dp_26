@@ -144,8 +144,9 @@ class ScanGeometry:
     y_step_mm: float = 0.35
     """Y travel per sweep move.  0.35 mm is what the old 1.2 s @ PWM 70
     actuator pulse moved on average."""
-    x_step_mm: float = 0.40
-    x_return_mm: float = 0.40
+    x_step_mm: float = 1.20
+    """X advance per column (tripled from 0.40 mm)."""
+    x_return_mm: float = 1.20
     """X travel of the return move at the end of a column.  Kept equal to
     ``x_step_mm`` unless the operator overrides it (a backlash-prone belt can
     need a longer return than advance)."""

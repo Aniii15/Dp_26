@@ -74,6 +74,7 @@ Y_CORRECTION_RATIO = 1.25   # corrective / back-off Y move vs. a sweep move
 # DIR pin level for each Y direction.  VERIFY ON THE RIG; swap if inverted.
 Y_DIR = {"down": 0, "up": 1}
 MOVE_TIMEOUT_S = 30.0       # longest wait for a queued move to finish
+SWEEP_SPEED_US_DEFAULT = 1000   # sweep step half-period: 1000 us = 500 Hz
 R_STEPS_PER_REV = 1600
 DEGREES_PER_STEP = 360 / R_STEPS_PER_REV
 
@@ -1470,6 +1471,8 @@ class MotorControlApp(tk.Tk):
         tk.Label(box, textvariable=self._autosweep_timer_var, bg=C["panel"],
                  fg=C["accent"], font=FONT_LABEL).pack(anchor="w")
 
+        self._build_sweep_speed_panel(parent)
+
         # ── live stitching feedback (mirrors the mosaic panel) ───────────────
         stitch = self._card(parent, "LIVE STITCH", C["accent2"],
                             "every saved frame is stitched as it arrives; "
@@ -1495,6 +1498,62 @@ class MotorControlApp(tk.Tk):
         row.pack(fill="x", padx=2)
         self._build_motion_detector_panel(row)
         self._build_boundary_detector_panel(row)
+
+    # ── Sweep motor speed ─────────────────────────────────────────────────────
+
+    def _build_sweep_speed_panel(self, parent):
+        """Pulse rate used by every X/Y/Z move of the sweep (AF Z moves too).
+
+        The value is the firmware's step *half*-period: 1000 µs = 500 Hz.
+        It is sent when a sweep starts, and "Apply now" changes it mid-sweep;
+        the move already in progress finishes at the old rate."""
+        card = self._card(parent, "SWEEP MOTOR SPEED", C["accent"],
+                          "half-period per pulse, lower = faster; applies to "
+                          "X, Y and Z (autofocus) moves")
+        self._sweep_speed_us = tk.IntVar(value=SWEEP_SPEED_US_DEFAULT)
+        self._sweep_speed_info = tk.StringVar()
+        self._sweep_speed_applied = tk.StringVar(value="")
+
+        tk.Scale(card, from_=50, to=2000, resolution=50, orient="horizontal",
+                 variable=self._sweep_speed_us, bg=C["panel"], fg=C["text"],
+                 troughcolor=C["surface"], highlightthickness=0,
+                 font=FONT_SMALL, label="µs half-period",
+                 command=lambda _v: self._sweep_speed_refresh()
+                 ).pack(fill="x", pady=2)
+        tk.Label(card, textvariable=self._sweep_speed_info, bg=C["panel"],
+                 fg=C["text"], font=FONT_LABEL).pack(anchor="w")
+
+        row = tk.Frame(card, bg=C["panel"])
+        row.pack(fill="x", pady=(4, 0))
+        self._make_btn(row, "Apply now", self._apply_sweep_speed).pack(
+            side="left", padx=(0, 8))
+        tk.Label(row, textvariable=self._sweep_speed_applied, bg=C["panel"],
+                 fg=C["muted"], font=FONT_SMALL).pack(side="left")
+        self._sweep_speed_refresh()
+
+    def _sweep_speed_value(self) -> int:
+        """Selected half-period in µs, snapped to the firmware's 50 µs tick."""
+        try:
+            us = int(self._sweep_speed_us.get())
+        except (tk.TclError, ValueError):
+            us = SWEEP_SPEED_US_DEFAULT
+        return int(min(2000, max(50, round(us / 50) * 50)))
+
+    def _sweep_speed_refresh(self):
+        us = self._sweep_speed_value()
+        hz = 1e6 / (2 * us)
+        mm_s = hz / STEPS_PER_MM
+        rpm = hz / PULSES_PER_REV * 60
+        warn = "   ⚠ fast, no accel ramp" if hz > 2000 else ""
+        self._sweep_speed_info.set(
+            f"{hz:,.0f} Hz · {mm_s:.3f} mm/s · {rpm:.1f} RPM{warn}")
+
+    def _apply_sweep_speed(self):
+        us = self._sweep_speed_value()
+        state = "live, next move" if self._autosweep_running else "now"
+        self._log(f"[SPEED] sweep speed -> {us} µs ({state})")
+        self._sweep_speed_applied.set(f"sent {us} µs")
+        self._threaded(set_speed, us, self._log)
 
     # ── Tab: Focus ────────────────────────────────────────────────────────────
 
@@ -2321,6 +2380,8 @@ class MotorControlApp(tk.Tk):
         # Take the step sizes from the panel *here*, on the Tk thread: the
         # worker must never touch a StringVar (that is a cross-thread Tk call).
         self._scan_geo_sync()
+        self._sweep_start_speed_us = self._sweep_speed_value()
+        self._sweep_speed_applied.set(f"sent {self._sweep_start_speed_us} µs")
         self._prev_capture_tag = None
         threading.Thread(target=self._sweep_worker, daemon=True).start()
 
@@ -2381,7 +2442,10 @@ class MotorControlApp(tk.Tk):
         af_x_steps, af_x_delay = self._parse_af_params(
             self.af_x_c_var, self.af_x_m_var, self.af_x_f_var, self.af_x_d_var, "X")
 
-        set_speed(1000, self._log)
+        speed_us = getattr(self, "_sweep_start_speed_us", SWEEP_SPEED_US_DEFAULT)
+        self._log(f"[SWEEP] motor speed {speed_us} µs half-period "
+                  f"({1e6 / (2 * speed_us):,.0f} Hz)")
+        set_speed(speed_us, self._log)
         time.sleep(0.2)
 
         column = 1

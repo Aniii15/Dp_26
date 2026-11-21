@@ -56,7 +56,7 @@ the URL** - no protocol, no framing, no acknowledgements:
 
 ```python
 http_get(f"{BASE_URL}/move_x?steps=320&dir=1")   # tell the motor to go
-http_get(f"{BASE_URL}/status")                   # ask if it is still going
+# no "done" message: completion is seen by the camera (MotionDetector)
 ```
 
 `move_z`, `move_x`, `move_r`, `move_actuator`, `set_speed`, `emergency_stop`

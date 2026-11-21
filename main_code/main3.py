@@ -4,7 +4,8 @@ ESP32 Wireless Motor Control — Desktop GUI  (run: python main3.py)
 Motors: X, Y, Z = MKS SERVO42D closed-loop steppers on 4 mm-pitch lead
 screws (3200 pulses/rev -> 800 pulses = 1 mm), R rotation on TB6600
 (1600 steps/rev).  Firmware: esp32_motors - a move is queued and the HTTP reply
-comes back at once; /status reports the pulses still queued per axis.
+comes back at once.  Move completion is detected visually: after each command
+the app waits until the camera sees motion, then waits for stillness.
 Talks to the ESP32 over WiFi via HTTP GET.
 
 Features: live HDMI camera feed, visual motion detection (closed-loop
@@ -92,10 +93,29 @@ CAMERA_INDEX = 0               # OpenCV capture index of the HDMI card
 MOTION_THRESHOLD = 20000   # changed-pixel count that counts as motion
 STILLNESS_FRAMES = 5       # consecutive still frames = motor stopped
 FRAME_DIFF_THRESHOLD = 20      # per-pixel diff that counts as "changed"
+# Visual move-completion wait (replaces polling the ESP32's /status)
+MOTION_START_TIMEOUT_S = 2.0       # how long to wait for a move to become visible
+MOVE_SETTLE_S = 0.15               # extra wait when no motion was ever seen
 
 # Boundary detection tuning
 BOUNDARY_THRESHOLD = 30  # gray level separating blade from background
 UPPER_BOUNDARY_THRESHOLD = 50  # stricter threshold for upper-boundary checks
+# (the two gray thresholds above now only drive the LOWER boundary)
+
+# Background-colour model for LEFT / RIGHT / UPPER boundaries.
+# The grey/blue background is learned from a crop of a reference image; a pixel
+# is "blade" when its Lab chroma (a,b) is far from the background's mean chroma.
+# Chroma (not brightness) is used because vignetting makes the background's
+# brightness overlap the blade's, while their colours stay well apart
+# (measured: background within ~5, blade >= ~11 chroma units).
+BG_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "bg_image_uncropped.jpeg")
+BG_CROP = (20, 310, 18, 265)    # y0, y1, x0, x1 — inside the yellow box, clean bg only
+BG_CHROMA_THRESHOLD       = 10  # chroma distance that counts as blade
+UPPER_BG_CHROMA_THRESHOLD = 13  # stricter value used for upper-boundary checks
+MIN_BLADE_AREA_FRAC       = 0.005  # ignore blobs smaller than 0.5 % of the frame
+BG_MIN_LAB_L              = 50  # pixels darker than this (lens-vignette corners) never count
+                                # as blade — chroma is unreliable near black (bg L>=58, blade L>=77)
 
 # Live (on-the-fly) mosaicking.  When enabled, every frame the sweep saves is
 # also pushed to the streaming stitcher in image_stitching/live, which blends it
@@ -236,23 +256,40 @@ def http_get(endpoint: str, params: dict = None, log_fn=None) -> tuple[bool, str
     return False, msg
 
 
+# What was last commanded per axis, and the current step half-period, so a
+# visual wait knows how long the move should take: {axis: (t_cmd, steps)}.
+_LAST_MOVE: dict[str, tuple[float, int]] = {}
+_CURRENT_HALF_US = SWEEP_SPEED_US_DEFAULT
+
+
+def _send_move(axis: str, steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
+    _LAST_MOVE[axis.upper()] = (time.time(), int(steps))
+    return http_get(f"/{axis.lower()}", {"steps": steps, "dir": direction}, log_fn)
+
+
+def expected_move_s(axis: str) -> float:
+    """Pulse-train duration of the last move on ``axis`` at the current speed."""
+    _, steps = _LAST_MOVE.get(axis.upper(), (0.0, 0))
+    return steps * 2 * _CURRENT_HALF_US / 1e6
+
+
 def move_z(steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
-    return http_get("/z", {"steps": steps, "dir": direction}, log_fn)
+    return _send_move("Z", steps, direction, log_fn)
 
 
 def move_x(steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
     """``direction`` 1 = right (+X), 0 = left; X_DIR_INVERT maps it to the pin."""
     if X_DIR_INVERT:
         direction = 0 if direction else 1
-    return http_get("/x", {"steps": steps, "dir": direction}, log_fn)
+    return _send_move("X", steps, direction, log_fn)
 
 
 def move_r(steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
-    return http_get("/r", {"steps": steps, "dir": direction}, log_fn)
+    return _send_move("R", steps, direction, log_fn)
 
 
 def move_y(steps: int, direction: int, log_fn=None) -> tuple[bool, str]:
-    return http_get("/y", {"steps": steps, "dir": direction}, log_fn)
+    return _send_move("Y", steps, direction, log_fn)
 
 
 def move_y_dir(direction: str, mm: float, log_fn=None) -> tuple[bool, str]:
@@ -260,42 +297,16 @@ def move_y_dir(direction: str, mm: float, log_fn=None) -> tuple[bool, str]:
     return move_y(mm_to_y_steps(mm), Y_DIR[direction], log_fn)
 
 
-def axis_remaining(axis: str) -> int | None:
-    """Pulses still queued on ``axis`` ("X"/"Y"/"Z"/"R"), None if unreadable.
-
-    The firmware's /status reply looks like ``"X=0 Y=120 Z=0 R=0 "``."""
-    ok, resp = http_get("/status")
-    if not ok:
-        return None
-    for tok in resp.split():
-        k, _, v = tok.partition("=")
-        if k == axis and v.isdigit():
-            return int(v)
-    return None
-
-
-def wait_idle(axis: str, timeout_s: float = MOVE_TIMEOUT_S) -> bool:
-    """Block until the firmware has emitted every queued pulse on ``axis``.
-
-    esp32_motors answers "OK" *before* the move happens, so without this a
-    frame grabbed right after a move command is taken mid-move."""
-    end = time.time() + timeout_s
-    while time.time() < end:
-        rem = axis_remaining(axis)
-        if rem is None:
-            return False
-        if rem == 0:
-            return True
-        time.sleep(0.02)
-    return False
-
-
 def emergency_stop(log_fn=None) -> tuple[bool, str]:
     return http_get("/stop", log_fn=log_fn)
 
 
 def set_speed(us: int, log_fn=None) -> tuple[bool, str]:
-    return http_get("/speed", {"us": us}, log_fn)
+    global _CURRENT_HALF_US
+    ok, resp = http_get("/speed", {"us": us}, log_fn)
+    if ok:
+        _CURRENT_HALF_US = max(50, int(us))
+    return ok, resp
 
 
 def ping_esp32(log_fn=None) -> bool:
@@ -459,18 +470,83 @@ def train_siamese_pair(frame_a_bgr, frame_b_bgr, label: float, lr: float):
 #  Boundary Detection
 # ──────────────────────────────────────────────────────────────────────────────
 
-def detect_boundaries(frame_bgr, threshold=None) -> tuple[int, int, int, int] | None:
-    """Bounding box (left, right, upper, lower) of the blade, or None."""
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    if threshold is None:
-        threshold = BOUNDARY_THRESHOLD
-    _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(
-        thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def load_bg_chroma(path=BG_IMAGE_PATH, crop=BG_CROP):
+    """Mean Lab (a, b) chroma of the cropped background patch, or None."""
+    img = cv2.imread(path)
+    if img is None:
+        print(f"[BOUNDARY] Background image not found: {path} — using gray logic only")
+        return None
+    y0, y1, x0, x1 = crop
+    patch = cv2.GaussianBlur(img, (5, 5), 0)[y0:y1, x0:x1]
+    lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+    ab = lab[:, 1:].mean(axis=0)
+    print(f"[BOUNDARY] Background chroma (a, b) = ({ab[0]:.1f}, {ab[1]:.1f}) "
+          f"from {os.path.basename(path)} crop {crop}")
+    return ab
+
+
+BG_CHROMA = load_bg_chroma()
+
+
+def _largest_blob_box(mask):
+    """Bounding box (x, y, w, h) of the largest contour in mask, or None."""
+    k = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)    # drop isolated noise pixels
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)   # fill small holes in the blade
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
-    x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
-    return x, x + w, y, y + h
+    c = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(c) < MIN_BLADE_AREA_FRAC * mask.shape[0] * mask.shape[1]:
+        return None
+    return cv2.boundingRect(c)
+
+
+def _gray_box(frame_bgr, threshold):
+    """Original logic: brightest-above-threshold blob (used for the lower edge)."""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    return cv2.boundingRect(max(contours, key=cv2.contourArea))
+
+
+def _bg_color_box(frame_bgr, chroma_threshold):
+    """Blob of pixels whose Lab chroma differs from the background's."""
+    lab = cv2.cvtColor(cv2.GaussianBlur(frame_bgr, (5, 5), 0), cv2.COLOR_BGR2LAB)
+    ab = lab[:, :, 1:].astype(np.float32)
+    dist = np.sqrt(((ab - BG_CHROMA) ** 2).sum(axis=2))
+    mask = ((dist > chroma_threshold) & (lab[:, :, 0] >= BG_MIN_LAB_L)).astype(np.uint8) * 255
+    return _largest_blob_box(mask)
+
+
+def detect_boundaries(frame_bgr, threshold=None) -> tuple[int, int, int, int] | None:
+    """Bounding box (left, right, upper, lower) of the blade, or None.
+
+    left / right / upper : background-colour model (BG_CHROMA)
+    lower                : original gray threshold (`threshold`)
+    Passing UPPER_BOUNDARY_THRESHOLD also selects the stricter chroma threshold.
+    """
+    if threshold is None:
+        threshold = BOUNDARY_THRESHOLD
+    g = _gray_box(frame_bgr, threshold)
+    if BG_CHROMA is None:                       # no reference image → old behaviour
+        if g is None:
+            return None
+        x, y, w, h = g
+        return x, x + w, y, y + h
+
+    chroma_thr = (UPPER_BG_CHROMA_THRESHOLD if threshold == UPPER_BOUNDARY_THRESHOLD
+                  else BG_CHROMA_THRESHOLD)
+    c = _bg_color_box(frame_bgr, chroma_thr)
+    if c is None:
+        return None
+    x, y, w, h = c
+    # No gray blob → lower edge reads as frame top, i.e. 100 % (same as before
+    # when nothing was detected).
+    lower = (g[1] + g[3]) if g is not None else 0
+    return x, x + w, y, lower
 
 
 def draw_focus_roi(frame, roi) -> np.ndarray:
@@ -1122,7 +1198,7 @@ class MotorControlApp(tk.Tk):
 
         row = tk.Frame(f, bg=C["panel"])
         row.pack(fill="x", pady=2)
-        tk.Label(row, text="Black Threshold:", bg=C["panel"], fg=C["muted"],
+        tk.Label(row, text="Lower (gray) Thr:", bg=C["panel"], fg=C["muted"],
                  font=FONT_SMALL).pack(side="left")
         self.bd_threshold = tk.StringVar(value=str(BOUNDARY_THRESHOLD))
         self.bd_threshold.trace_add(
@@ -1130,16 +1206,30 @@ class MotorControlApp(tk.Tk):
         self._make_entry(row, self.bd_threshold, w=4).pack(side="left", padx=4)
         tk.Label(row, text="(0-255)", bg=C["panel"], fg=C["muted"],
                  font=FONT_SMALL).pack(side="left")
+        row2 = tk.Frame(f, bg=C["panel"])
+        row2.pack(fill="x", pady=2)
+        tk.Label(row2, text="L/R/Up BG-colour Thr:", bg=C["panel"], fg=C["muted"],
+                 font=FONT_SMALL).pack(side="left")
+        self.bd_chroma = tk.StringVar(value=str(BG_CHROMA_THRESHOLD))
+        self.bd_chroma.trace_add("write", lambda *_: self._update_boundary_params())
+        self._make_entry(row2, self.bd_chroma, w=4).pack(side="left", padx=4)
+        tk.Label(row2, text="(chroma)" if BG_CHROMA is not None else "(no bg image!)",
+                 bg=C["panel"], fg=C["muted"], font=FONT_SMALL).pack(side="left")
+
 
         self._bd_status_var = tk.StringVar(value="No boundary detected")
         tk.Label(f, textvariable=self._bd_status_var, bg=C["panel"],
                  fg=C["muted"], font=FONT_SMALL).pack(anchor="w", pady=4)
 
     def _update_boundary_params(self):
-        global BOUNDARY_THRESHOLD
+        global BOUNDARY_THRESHOLD, BG_CHROMA_THRESHOLD
         try:
             BOUNDARY_THRESHOLD = int(self.bd_threshold.get())
         except ValueError:
+            pass
+        try:
+            BG_CHROMA_THRESHOLD = float(self.bd_chroma.get())
+        except (ValueError, AttributeError):
             pass
 
     def _status_ui_tick(self):
@@ -2130,7 +2220,7 @@ class MotorControlApp(tk.Tk):
 
         def step_and_get(dir_mult, size):
             move_z(size, 1 if dir_mult > 0 else 0)
-            wait_idle("Z")      # firmware replies before the move is done
+            self._wait_axis("Z")  # firmware replies before the move is done
             time.sleep(delay)
             return self._get_frame()
 
@@ -2841,48 +2931,59 @@ class MotorControlApp(tk.Tk):
             return self._latest_frame_raw.copy() if self._latest_frame_raw is not None else None
 
     def _wait_axis(self, axis: str) -> bool:
-        """Wait for a stepper move via the firmware's /status pulse counter;
-        fall back to visual stillness if /status cannot be read."""
-        if wait_idle(axis):
-            return True
-        self._log(f"[MOTION] {axis}: /status unavailable or timed out - "
-                  "falling back to visual feedback")
-        return self._wait_motion_stop()
+        """Wait (visually) for the last move commanded on ``axis``."""
+        t_cmd, _ = _LAST_MOVE.get(axis.upper(), (time.time(), 0))
+        return self._wait_move_done(t_cmd, axis=axis)
 
-    def _wait_move_done(self, t_cmd: float, expected_s: float = 0.0,
-                        start_timeout: float = 0.8, timeout_s: float = 10.0,
+    def _wait_move_done(self, t_cmd: float, expected_s: float | None = None,
+                        start_timeout: float | None = None,
+                        timeout_s: float | None = None,
                         axis: str | None = None) -> bool:
-        """Wait until a commanded move has actually happened *and* stopped.
+        """Wait until a commanded move has visibly *started* and then *stopped*.
 
-        With ``axis`` the firmware's /status pulse counter is authoritative
-        (the stepper firmware knows exactly when the last pulse went out); the
-        visual path below is only the fallback when /status cannot be read.
+        Purely camera-based (no /status polling of the ESP32):
 
-        ``_wait_motion_stop`` alone returns at once if the detector is still
-        "still" from before the move - i.e. before the actuator has even
-        started.  The recorded scans show exactly that: each autofocus frame
-        sits ~265 px further along the Y move than the frame saved just before
-        it, ``Ycor_up`` frames continue ~210 px in the *previous* direction, and
-        Y-move frames carry 10-17 % less vertical detail than the (still) AF
-        frames - they were grabbed mid-move, motion-blurred.
+        1. Wait for the motion detector to see motion **after** ``t_cmd``.
+           Stillness left over from before the command cannot end the wait.
+        2. Then wait for stillness, but never before the move's expected
+           pulse-train time has passed (steps x 2 x half-period), so a slow move
+           that looks "still" between two frames is not cut short.
 
-        So: wait out the commanded duration (whether or not the HTTP call
-        blocked), give the detector a moment to *see* motion if it has not yet,
-        then wait for stillness.
+        If no motion is seen within ``start_timeout`` (a move too small for the
+        detector, e.g. a 25-pulse Z step), wait out the expected time plus
+        MOVE_SETTLE_S and return False, so the caller never fires the next
+        command onto a move that is still running.
         """
-        if axis is not None:
-            if wait_idle(axis):
+        if expected_s is None:
+            expected_s = expected_move_s(axis) if axis else 0.0
+        if start_timeout is None:
+            start_timeout = MOTION_START_TIMEOUT_S
+        if timeout_s is None:
+            timeout_s = expected_s + 10.0
+        tag = axis or "move"
+        md = self._motion_detector
+
+        # 1. movement must start
+        while not md.motion_since(t_cmd):
+            if time.time() - t_cmd > start_timeout:
+                rest = expected_s + MOVE_SETTLE_S - (time.time() - t_cmd)
+                if rest > 0:
+                    time.sleep(rest)
+                self._log(f"[MOTION] {tag}: no movement seen within "
+                          f"{start_timeout:.1f}s (expected {expected_s:.2f}s) - "
+                          "waited it out; lower Motion Threshold if this repeats")
+                return False
+            time.sleep(0.02)
+
+        # 2. movement must stop (and not before the pulses can have finished)
+        while True:
+            elapsed = time.time() - t_cmd
+            if elapsed >= expected_s and md.is_still():
                 return True
-            self._log(f"[MOTION] {axis}: /status unavailable or timed out - "
-                      "falling back to visual feedback")
-        remaining = expected_s - (time.time() - t_cmd)
-        if remaining > 0:
-            time.sleep(remaining)
-        t0 = time.time()
-        while (not self._motion_detector.motion_since(t_cmd)
-               and time.time() - t0 < start_timeout):
-            time.sleep(0.03)
-        return self._wait_motion_stop(timeout_s)
+            if elapsed > timeout_s:
+                self._log(f"[MOTION] {tag}: still moving after {timeout_s:.1f}s")
+                return False
+            time.sleep(0.02)
 
     def _wait_motion_stop(self, timeout_s: float = 10.0) -> bool:
         """Block until the motion detector reports stillness, or timeout."""

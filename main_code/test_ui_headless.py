@@ -629,7 +629,7 @@ def main() -> int:
             return True, "ok"
 
         main3.move_z = fake_move_z
-        main3.wait_idle = lambda axis, timeout_s=0.0: True   # firmware /status
+        app._wait_axis = lambda axis: True   # visual move wait (no camera here)
         app._wait_motion_stop = lambda timeout_s=10.0: True
         app._af_mode_var.set("Region-wise (recommended)")
         app.af_range_var.set("4000")
